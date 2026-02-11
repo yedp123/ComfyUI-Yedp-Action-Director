@@ -27,7 +27,7 @@ Unlike static image loaders, this node performs the rendering **client-side** (i
 
 1. **Clone the repository** into your ComfyUI custom nodes directory:  
    cd ComfyUI/custom\_nodes/  
-   git clone \[https://github.com/YourUsername/ComfyUI-Yedp-Action-Director.git\](https://github.com/YourUsername/ComfyUI-Yedp-Action-Director.git)
+   git clone https://github.com/yedp123/ComfyUI-Yedp-Action-Director.git
 
 2. **Install Dependencies:**  
    No external Python dependencies are required beyond standard ComfyUI requirements. The frontend libraries (Three.js) are loaded dynamically.  
