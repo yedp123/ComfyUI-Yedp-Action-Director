@@ -26,7 +26,7 @@ Unlike static image loaders, this node performs the rendering **client-side** (i
 ## **📥 Installation**
 
 1. **Clone the repository** into your ComfyUI custom nodes directory:  
-   cd ComfyUI/custom\_nodes/  
+   cd ComfyUI/custom_nodes  
    git clone https://github.com/yedp123/ComfyUI-Yedp-Action-Director.git
 
 2. **Install Dependencies:**  
