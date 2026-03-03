@@ -37,8 +37,8 @@ The entire architecture has been rebuilt from the ground up for maximum performa
 ## **📥 Installation**
 
 1. **Clone the repository** into your ComfyUI custom nodes directory:  
-   cd ComfyUI/custom\_nodes/  
-   git clone https://github.com/YourUsername/ComfyUI-Yedp-Action-Director.git
+   cd ComfyUI/custom_nodes  
+   git clone https://github.com/yedp123/ComfyUI-Yedp-Action-Director.git
 
 2. **Install Dependencies:**  
    No external Python dependencies are required beyond standard ComfyUI requirements. The frontend libraries (Three.js) are loaded dynamically.  
