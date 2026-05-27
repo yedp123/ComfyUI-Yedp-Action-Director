@@ -30,6 +30,9 @@ if "yedp_mocap" not in folder_paths.folder_names_and_paths:
 if "yedp_blockout" not in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["yedp_blockout"] = ([os.path.join(folder_paths.get_input_directory(), "yedp_blockout")], {".json"})
 
+if "yedp_scenes" not in folder_paths.folder_names_and_paths:
+    folder_paths.folder_names_and_paths["yedp_scenes"] = ([os.path.join(folder_paths.get_input_directory(), "yedp_scenes")], {".json"})
+
 if "yedp_hdri" not in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["yedp_hdri"] = ([os.path.join(folder_paths.get_input_directory(), "yedp_hdri")], {".hdr", ".exr"})
 
@@ -415,7 +418,7 @@ async def save_scene(request):
         name = data.get("name", "SavedScene")
         scene_data = data.get("data", "{}")
         
-        safe_name = "".join([c for c in name if c.isalnum() or c in [' ', '_', '-']]).rstrip()
+        safe_name = "".join([c for c in name if c.isalnum() or c in [' ', '_', '-', '.']]).rstrip()
         safe_name = safe_name.replace(" ", "_")
         if not safe_name.endswith(".json"):
             safe_name += ".json"
@@ -440,6 +443,47 @@ async def save_scene(request):
         return web.json_response({"status": "success", "file": safe_name})
     except Exception as e:
         print(f"[Yedp] Failed to save Scene: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+@PromptServer.instance.routes.get("/yedp/get_ad_scenes")
+async def get_ad_scenes(request):
+    files = folder_paths.get_filename_list("yedp_scenes")
+    if not files:
+        files = []
+    return web.json_response({"files": files})
+
+@PromptServer.instance.routes.post("/yedp/save_ad_scene")
+async def save_ad_scene(request):
+    try:
+        data = await request.json()
+        name = data.get("name", "SavedScene")
+        scene_data = data.get("data", "{}")
+        
+        safe_name = "".join([c for c in name if c.isalnum() or c in [' ', '_', '-', '.']]).rstrip()
+        safe_name = safe_name.replace(" ", "_")
+        if not safe_name.endswith(".json"):
+            safe_name += ".json"
+
+        scene_dir = folder_paths.folder_names_and_paths["yedp_scenes"][0][0]
+        scene_dir = os.path.realpath(scene_dir)
+        try:
+            os.makedirs(scene_dir, exist_ok=True)
+        except Exception as e:
+            pass 
+        
+        file_path = os.path.join(scene_dir, safe_name)
+        
+        if isinstance(scene_data, str):
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(scene_data)
+        else:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(scene_data, f)
+            
+        print(f"[Yedp] Saved Action Director Scene data to {file_path}")
+        return web.json_response({"status": "success", "file": safe_name})
+    except Exception as e:
+        print(f"[Yedp] Failed to save Action Director Scene: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
