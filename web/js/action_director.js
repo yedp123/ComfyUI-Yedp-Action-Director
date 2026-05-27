@@ -53,12 +53,12 @@ const loadThreeJS = async () => {
             const DropInViewer = splatLib.DropInViewer || splatLib.default?.DropInViewer;
 
             // --- NEW: Path Tracing Imports ---
-            const bvhLib = await import(new URL("./three-mesh-bvh.module.js?t=" + Date.now(), baseUrl).href);
+            const bvhLib = await import(new URL("./three-mesh-bvh.module.js", baseUrl).href);
             THREE.BufferGeometry.prototype.computeBoundsTree = bvhLib.computeBoundsTree;
             THREE.BufferGeometry.prototype.disposeBoundsTree = bvhLib.disposeBoundsTree;
             THREE.Mesh.prototype.raycast = bvhLib.acceleratedRaycast;
             
-            const ptLib = await import(new URL("./three-gpu-pathtracer.module.js?t=" + Date.now(), baseUrl).href);
+            const ptLib = await import(new URL("./three-gpu-pathtracer.module.js", baseUrl).href);
             // ---------------------------------
             
             const { GLTFExporter } = await import(new URL("./GLTFExporter.js", baseUrl).href);
@@ -435,6 +435,10 @@ class YedpViewport {
         this.availableCams = ["none"];
         this.availableRigs = ["Yedp_Rig.glb"];
 
+        // Cached DOM refs for the animation loop (set in setupTimeline)
+        this._sliderEl = null;
+        this._timeLabelEl = null;
+
         this.availableHdris = ["none"];
         this.currentHdriMap = null;
         this.isHdriEnabled = false;
@@ -457,6 +461,12 @@ class YedpViewport {
         this._handleKeyDown = this.handleKeyDown.bind(this);
         window.addEventListener('keydown', this._handleKeyDown);
         
+        // Pre-allocated temp objects for hot-path reuse (avoids GC pressure)
+        this._tmpVec3A = null; // Initialized after THREE is loaded
+        this._tmpVec3B = null;
+        this._tmpQuatA = null;
+        this._tmpEulerA = null;
+        
         // Reference stored to allow unbinding during cleanup
         this.resizeObserver = null; 
 
@@ -478,7 +488,7 @@ class YedpViewport {
             this.updateHDRI();
             return;
         }
-        const url = `/view?filename=${filename}&type=input&subfolder=yedp_hdri&t=${Date.now()}`;
+        const url = `/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=yedp_hdri&t=${Date.now()}`;
         try {
             const loader = new this.HDRLoader(); 
             const texture = await loader.loadAsync(url);
@@ -762,6 +772,12 @@ class YedpViewport {
             this.scene = new this.THREE.Scene();
             this.scene.background = new this.THREE.Color(0x1a1a1a); 
 
+            // Initialize pre-allocated temp objects now that THREE is available
+            this._tmpVec3A = new this.THREE.Vector3();
+            this._tmpVec3B = new this.THREE.Vector3();
+            this._tmpQuatA = new this.THREE.Quaternion();
+            this._tmpEulerA = new this.THREE.Euler();
+
             this.gridHelper = new this.THREE.GridHelper(10, 10, 0x444444, 0x222222);
             this.scene.add(this.gridHelper);
             this.axesHelper = new this.THREE.AxesHelper(1);
@@ -971,7 +987,11 @@ class YedpViewport {
             this.animate();
 
         } catch (e) {
-            this.container.innerHTML = `<div style="color:red; padding:20px;">Init Error: ${e.message}</div>`;
+            this.container.innerHTML = '';
+            const errDiv = document.createElement('div');
+            Object.assign(errDiv.style, { color: 'red', padding: '20px' });
+            errDiv.textContent = 'Init Error: ' + e.message;
+            this.container.appendChild(errDiv);
         }
     }
 
@@ -1080,7 +1100,7 @@ class YedpViewport {
         this.loadModal.style.display = "flex";
         
         try {
-            const res = await api.fetchApi("/yedp/get_scenes");
+            const res = await api.fetchApi("/yedp/get_ad_scenes");
             const data = await res.json();
             body.innerHTML = "";
             
@@ -1218,11 +1238,11 @@ class YedpViewport {
             const oldLights = [...this.lights]; oldLights.forEach(l => this.removeLight(l.id));
 
             if (state.settings) {
-                this.isShadedMode = state.settings.isShadedMode || false;
-                this.isDepthMode = state.settings.isDepthMode || false;
-                this.isTexturedMode = state.settings.isTexturedMode || false;
-                this.userNear = state.settings.userNear || 0.1;
-                this.userFar = state.settings.userFar || 10.0;
+                this.isShadedMode = state.settings.isShadedMode ?? false;
+                this.isDepthMode = state.settings.isDepthMode ?? false;
+                this.isTexturedMode = state.settings.isTexturedMode ?? false;
+                this.userNear = state.settings.userNear ?? 0.1;
+                this.userFar = state.settings.userFar ?? 10.0;
                 
                 const chkT = this.container.querySelector("#chk-textured"); if(chkT) chkT.checked = this.isTexturedMode;
                 const chkS = this.container.querySelector("#chk-shaded"); if(chkS) chkS.checked = this.isShadedMode;
@@ -1230,21 +1250,21 @@ class YedpViewport {
                 const inpN = this.container.querySelector("#inp-near"); if(inpN) inpN.value = this.userNear;
                 const inpF = this.container.querySelector("#inp-far"); if(inpF) inpF.value = this.userFar;
                 if (this.isDepthMode) this.container.querySelector("#depth-ctrls").style.opacity = "1.0";
-                this.isPathTracingEnabled = state.settings.isPathTracingEnabled || false;
+                this.isPathTracingEnabled = state.settings.isPathTracingEnabled ?? false;
                 const chkPt = this.container.querySelector("#chk-pt-en"); if(chkPt) chkPt.checked = this.isPathTracingEnabled;
                 
-                this.ptPreviewSamples = state.settings.ptPreviewSamples || 32;
-                this.ptBakeSamples = state.settings.ptBakeSamples || 128;
+                this.ptPreviewSamples = state.settings.ptPreviewSamples ?? 32;
+                this.ptBakeSamples = state.settings.ptBakeSamples ?? 128;
                 // Note: If you want the sliders to visually update their numbers, you can select them by creating IDs for them too, 
                 // but they will respect the internal variables regardless.
                 
-                this.isHdriEnabled = state.settings.isHdriEnabled || false;
+                this.isHdriEnabled = state.settings.isHdriEnabled ?? false;
                 const chkHdriEn = this.container.querySelector("#chk-hdri-en"); if(chkHdriEn) chkHdriEn.checked = this.isHdriEnabled;
                 
-                this.isHdriBgEnabled = state.settings.isHdriBgEnabled || false;
+                this.isHdriBgEnabled = state.settings.isHdriBgEnabled ?? false;
                 const chkHdriBg = this.container.querySelector("#chk-hdri-bg"); if(chkHdriBg) chkHdriBg.checked = this.isHdriBgEnabled;
                 
-                this.hdriRotation = state.settings.hdriRotation || 0;
+                this.hdriRotation = state.settings.hdriRotation ?? 0;
                 const sldRot = this.container.querySelector("#sld-hdri-rot"); if(sldRot) sldRot.value = this.hdriRotation;
                 const inpRot = this.container.querySelector("#inp-hdri-rot"); if(inpRot) inpRot.value = this.hdriRotation;
                 
@@ -1509,15 +1529,20 @@ class YedpViewport {
             const defaultName = `Scene_${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}_${String(date.getHours()).padStart(2,'0')}-${String(date.getMinutes()).padStart(2,'0')}`;
             const name = prompt("Enter a name for your save file:", defaultName);
             if (!name) return;
+        
+            let safeName = name.replace(/[\/\\:*?"<>|]+/g, '_').substring(0, 128);
+            if (!safeName.toLowerCase().endsWith('.json')) {
+            safeName += '.json';
+            }
             
             const btn = div.querySelector("#btn-save-scene");
             btn.innerText = "SAVING...";
             try {
                 const sceneData = this.serializeScene();
-                const res = await api.fetchApi("/yedp/save_scene", {
+                const res = await api.fetchApi("/yedp/save_ad_scene", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ name: name, data: sceneData })
+                    body: JSON.stringify({ name: safeName, data: sceneData })
                 });
                 const result = await res.json();
                 if (result.status === "success") {
@@ -1583,6 +1608,10 @@ class YedpViewport {
         
         const btn = div.querySelector("#btn-play");
         const slider = div.querySelector("#t-slider");
+        
+        // Cache DOM refs for the animation loop
+        this._sliderEl = slider;
+        this._timeLabelEl = div.querySelector("#t-time");
         
         btn.onclick = () => { this.isPlaying = !this.isPlaying; btn.innerText = this.isPlaying ? "⏸" : "▶"; };
         slider.onmousedown = () => { this.isDraggingSlider = true; this.isPlaying = false; btn.innerText = "▶"; };
@@ -1706,14 +1735,16 @@ class YedpViewport {
 
                     if (c.useRootMotion && domItem && domItem.rootInterpolant) {
                         let rawPosArr = domItem.rootInterpolant.evaluate(domTau);
-                        let currentRawPos = new this.THREE.Vector3(rawPosArr[0], rawPosArr[1], rawPosArr[2]);
+                        this._tmpVec3A.set(rawPosArr[0], rawPosArr[1], rawPosArr[2]);
+                        let currentRawPos = this._tmpVec3A;
                         
                         if (c.lastDomItem !== domItem || domTau < c.lastDomTau - 0.01 || Math.abs(domTau - c.lastDomTau) > 0.5) {
                             c.lastRawPos.copy(currentRawPos);
                         } else {
-                            let posDelta = currentRawPos.clone().sub(c.lastRawPos);
-                            c.continuousPos.x += posDelta.x;
-                            c.continuousPos.z += posDelta.z;
+                            let pdx = currentRawPos.x - c.lastRawPos.x;
+                            let pdz = currentRawPos.z - c.lastRawPos.z;
+                            c.continuousPos.x += pdx;
+                            c.continuousPos.z += pdz;
                             c.lastRawPos.copy(currentRawPos);
                         }
                         
@@ -1864,12 +1895,17 @@ class YedpViewport {
                             this.helpModal.dataset.loaded = "true";
                         })
                         .catch(err => {
-                            body.innerHTML = `
-                                <div style="color:#ff5555; padding:20px; text-align:center;">
-                                    <h3>Failed to load manual</h3>
-                                    <p>${err.message}</p>
-                                    <p>Make sure <b>yedp_manual.html</b> is placed in the same folder as <b>action_director.js</b>.</p>
-                                </div>`;
+                            body.innerHTML = '';
+                            const errWrap = document.createElement('div');
+                            Object.assign(errWrap.style, { color: '#ff5555', padding: '20px', textAlign: 'center' });
+                            const h3 = document.createElement('h3');
+                            h3.textContent = 'Failed to load manual';
+                            const p1 = document.createElement('p');
+                            p1.textContent = err.message;
+                            const p2 = document.createElement('p');
+                            p2.innerHTML = 'Make sure <b>yedp_manual.html</b> is placed in the same folder as <b>action_director.js</b>.';
+                            errWrap.append(h3, p1, p2);
+                            body.appendChild(errWrap);
                         });
                 }
             }
@@ -2254,7 +2290,6 @@ class YedpViewport {
     ptRow.append(ptToggleWrap, ptPrevSld, ptBakeSld);
     // ---------------------------
 
-    // UPDATE this append line to include ptRow at the end!
     camCol.content.append(camSettingsRow, fovContainer, clipContainer, camRow1, camRow2, camImportRow, camImportFixRow);
 
     // LIGHTING
@@ -2324,15 +2359,17 @@ class YedpViewport {
         inpRot.value = this.hdriRotation;
         Object.assign(inpRot.style, { width:"36px", background:"#111", color:"#00d2ff", border:"1px solid #444", fontSize:"9px", padding:"2px", textAlign:"right" });
 
-        const syncRot = (v) => { 
-            this.hdriRotation = v; 
-            sldRot.value = v; 
-            inpRot.value = v; 
-            this.updateHDRI(); 
+        let hdriRotDebounceTimer = null;
+        const debouncedSyncRot = (v) => {
+            this.hdriRotation = v;
+            sldRot.value = v;
+            inpRot.value = v;
+            if (hdriRotDebounceTimer) clearTimeout(hdriRotDebounceTimer);
+            hdriRotDebounceTimer = setTimeout(() => this.updateHDRI(), 50);
         };
 
-        sldRot.oninput = (e) => syncRot(e.target.value);
-        inpRot.onchange = (e) => syncRot(parseFloat(e.target.value) || 0);
+        sldRot.oninput = (e) => debouncedSyncRot(e.target.value);
+        inpRot.onchange = (e) => { this.hdriRotation = parseFloat(e.target.value) || 0; sldRot.value = this.hdriRotation; this.updateHDRI(); };
         inpRot.addEventListener('keydown', stopEvent); 
         inpRot.addEventListener('mousedown', stopEvent);
 
@@ -2427,6 +2464,7 @@ class YedpViewport {
         const vidTimeline = document.createElement("input");
         vidTimeline.type = "range"; vidTimeline.min = 0; vidTimeline.max = 100; vidTimeline.value = 0;
         vidTimeline.style.flex = "1";
+        this._mocapVideoTimeline = vidTimeline;
         
         playRow.append(btnPlayPause, vidTimeline);
 
@@ -2587,6 +2625,9 @@ class YedpViewport {
             if (this.mocapTimer) { clearInterval(this.mocapTimer); this.mocapOverlay.style.display = "none"; }
             if (this.mocapMediaStream) this.mocapMediaStream.getTracks().forEach(t=>t.stop());
             this.mocapVideoEl.pause();
+            if (this.mocapVideoEl.src && this.mocapVideoEl.src.startsWith('blob:')) {
+                URL.revokeObjectURL(this.mocapVideoEl.src);
+            }
             this.mocapVideoEl.srcObject = null; this.mocapVideoEl.removeAttribute('src');
             this.mocapCanvasEl.getContext("2d").clearRect(0,0,this.mocapCanvasEl.width,this.mocapCanvasEl.height);
             this.debugMocapText.innerText = "Inactive";
@@ -2687,7 +2728,7 @@ class YedpViewport {
                             } else if (this.currentMocapSession.frames.length > 0) {
                                 this.currentMocapSession.frames.push(this.currentMocapSession.frames[this.currentMocapSession.frames.length-1]);
                             }
-                        } catch(e) {}
+                        } catch(e) { console.warn("[Yedp] Face detection frame error:", e); }
                         
                         const rangeSpan = targetEndTime - (this.mocapRangeStart * duration);
                         const progress = rangeSpan > 0 ? ((currentTime - (this.mocapRangeStart * duration)) / rangeSpan) * 100 : 100;
@@ -2819,7 +2860,7 @@ class YedpViewport {
                 let updated = false;
                 for (const file of data.files) {
                     try {
-                        const url = `/view?filename=${file}&type=input&subfolder=yedp_mocap&t=${Date.now()}`;
+                        const url = `/view?filename=${encodeURIComponent(file)}&type=input&subfolder=yedp_mocap&t=${Date.now()}`;
                         const req = await fetch(url);
                         const mocapData = await req.json();
                         
@@ -2904,9 +2945,8 @@ class YedpViewport {
         
         if (this.mocapVideoEl.readyState >= 2) {
             if (this.mocapVideoEl.duration) {
-                const vidTimeline = this.container.querySelector("input[type='range']");
-                if (vidTimeline && !this.mocapVideoEl.paused) {
-                    vidTimeline.value = (this.mocapVideoEl.currentTime / this.mocapVideoEl.duration) * 100;
+                if (this._mocapVideoTimeline && !this.mocapVideoEl.paused) {
+                    this._mocapVideoTimeline.value = (this.mocapVideoEl.currentTime / this.mocapVideoEl.duration) * 100;
                 }
             }
 
@@ -3173,35 +3213,41 @@ class YedpViewport {
         const isFBX = filename.toLowerCase().endsWith(".fbx");
         const loader = isFBX ? new this.FBXLoader() : new this.GLTFLoaderClass();
         let rigUrl;
-        if (filename === "Yedp_Rig.glb") {
-            // Default rig is stored in the extension's web folder
-            rigUrl = new URL(`../${filename}?t=${Date.now()}`, this.baseUrl).href;
-        } else {
-            // Custom rigs are in the ComfyUI input folder, requested via API
-            rigUrl = `/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=yedp_rigs&t=${Date.now()}`;
+        // Default rig and any .glb/.fbx found in the extension's web folder
+        const webUrl = new URL(`../${filename}?t=${Date.now()}`, this.baseUrl).href;
+        const inputUrl = `/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=yedp_rigs&t=${Date.now()}`;
+        
+        // Try web folder first for all rigs (the Python backend lists web folder rigs too)
+        // then fall back to input/yedp_rigs/
+        const tryUrls = [webUrl, inputUrl];
+        
+        for (const url of tryUrls) {
+            try {
+                console.log("[Yedp] Trying to load Rig from:", url);
+                const model = await loader.loadAsync(url);
+                const rig = isFBX ? model : model.scene;
+                
+                rig.traverse((child) => {
+                    if(child.isBone || child.type === "Bone" || child.isObject3D) {
+                        const normalized = semanticNormalize(child.name);
+                        if (normalized) this.semanticMap.set(normalized, child.name);
+                    }
+                });
+                
+                this.rigCaches.set(filename, rig);
+                return rig;
+            } catch(e) {
+                console.warn(`[Yedp] Rig not found at ${url}, trying next...`);
+                continue;
+            }
         }
         
-        try {
-            console.log("[Yedp] Loading Rig from:", rigUrl);
-            const model = await loader.loadAsync(rigUrl);
-            const rig = isFBX ? model : model.scene;
-            
-            rig.traverse((child) => {
-                if(child.isBone || child.type === "Bone" || child.isObject3D) {
-                    const normalized = semanticNormalize(child.name);
-                    if (normalized) this.semanticMap.set(normalized, child.name);
-                }
-            });
-            
-            this.rigCaches.set(filename, rig);
-            return rig;
-        } catch(e) {
-            console.error("[Yedp] Failed to load rig", filename, e);
-            if(filename !== "Yedp_Rig.glb") {
-                return await this.loadRig("Yedp_Rig.glb"); // Fallback
-            }
-            throw e;
+        // All URLs failed
+        console.error("[Yedp] Failed to load rig from any location:", filename);
+        if(filename !== "Yedp_Rig.glb") {
+            return await this.loadRig("Yedp_Rig.glb"); // Fallback
         }
+        throw new Error(`Failed to load rig: ${filename}`);
     }
 
     async loadCameraAnim(filename) {
@@ -3213,7 +3259,7 @@ class YedpViewport {
             return;
         }
         const isFBX = filename.toLowerCase().endsWith(".fbx");
-        const url = `/view?filename=${filename}&type=input&subfolder=yedp_cams&t=${Date.now()}`;
+        const url = `/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=yedp_cams&t=${Date.now()}`;
         try {
             const model = isFBX ? await new this.FBXLoader().loadAsync(url) : await new this.GLTFLoaderClass().loadAsync(url);
             let clip = isFBX ? model.animations?.[0] : (model.animations?.[0] || model.scene?.animations?.[0] || model.asset?.animations?.[0]);
@@ -3410,7 +3456,7 @@ class YedpViewport {
         }
 
         const ext = filename.split('.').pop().toLowerCase();
-        const url = `/view?filename=${filename}&type=input&subfolder=yedp_envs&t=${Date.now()}#.${ext}`;
+        const url = `/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=yedp_envs&t=${Date.now()}#.${ext}`;
         try {
             let targetObj;
             let model;
@@ -4060,7 +4106,7 @@ class YedpViewport {
         item.file = filename;
         const isFBX = filename.toLowerCase().endsWith(".fbx");
         const isBVH = filename.toLowerCase().endsWith(".bvh");
-        const url = `/view?filename=${filename}&type=input&subfolder=yedp_anims&t=${Date.now()}`;
+        const url = `/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=yedp_anims&t=${Date.now()}`;
         
         try {
             let model;
@@ -4128,19 +4174,21 @@ class YedpViewport {
         if (this.cameraAnimNode && this.cameraAction) {
             this.cameraAnimGroup.updateMatrixWorld(true);
             
-            const worldPos = new this.THREE.Vector3();
-            const worldQuat = new this.THREE.Quaternion();
+            const worldPos = this._tmpVec3A;
+            const worldQuat = this._tmpQuatA;
             this.cameraAnimNode.getWorldPosition(worldPos);
             this.cameraAnimNode.getWorldQuaternion(worldQuat);
 
-            const eulerOffset = new this.THREE.Euler(
+            this._tmpEulerA.set(
                 this.THREE.MathUtils.degToRad(this.camOverrideOffset.rx),
                 this.THREE.MathUtils.degToRad(this.camOverrideOffset.ry),
                 this.THREE.MathUtils.degToRad(this.camOverrideOffset.rz),
                 'XYZ'
             );
-            const quatOffset = new this.THREE.Quaternion().setFromEuler(eulerOffset);
-            worldQuat.multiply(quatOffset);
+            // _tmpQuatB used for offset since worldQuat occupies _tmpQuatA
+            if (!this._tmpQuatB) this._tmpQuatB = new this.THREE.Quaternion();
+            this._tmpQuatB.setFromEuler(this._tmpEulerA);
+            worldQuat.multiply(this._tmpQuatB);
 
             this.importedCamProxy.visible = !this.isCameraOverride && !this.isBaking;
             if (!this.isCameraOverride) {
@@ -4200,10 +4248,10 @@ class YedpViewport {
             
             const currentFrame = Math.floor(this.globalTime * fps);
             
-            const slider = this.container.querySelector("#t-slider");
+            const slider = this._sliderEl;
             if (slider && !this.isDraggingSlider) slider.value = currentFrame;
             
-            const timeLabel = this.container.querySelector("#t-time");
+            const timeLabel = this._timeLabelEl;
             if (timeLabel) timeLabel.innerText = `${currentFrame} / ${totalFrames}`;
 
             this.evaluateAnimations(this.globalTime);
@@ -4713,7 +4761,9 @@ class YedpViewport {
 
         try {
             // 1. Generate a unique payload ID for this session
-            const payloadId = `yedp_payload_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            const payloadId = typeof crypto !== 'undefined' && crypto.randomUUID 
+                ? `yedp_payload_${crypto.randomUUID()}`
+                : `yedp_payload_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
             
             // 2. Upload each visual pass as smaller individual chunks to stay under 100MB limits safely
             const passNames = Object.keys(results);
