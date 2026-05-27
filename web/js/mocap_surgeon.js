@@ -55,6 +55,7 @@ import { api } from "/scripts/api.js";
  * - MEMORY CORRUPTION FIX: Created temporary isolated filters for the GLB exporter and added isBlended flags. This prevents the export process from poisoning the live viewport filters with NaNs, resolving the scrubbing freeze.
  * - SLERP POPPING FIX: Added strict protection logic so playback doesn't overwrite manual edits. Corrected Slerp Target logic to blend into smoothed states, permanently eliminating GLB jitter snaps.
  * - GIZMO AXIS FIX: Switched TransformControls to Local space for bones (easier Maya-style rotation) and Global space for Hips translation.
+ * - TIMELINE REWRITE: Separated AI Tracking (Record) from Playback (Review) to eliminate extreme stuttering and MP crashing.
  */
 
 // --- ONE EURO FILTER IMPLEMENTATION ---
@@ -134,12 +135,12 @@ class OneEuroFilterQuat {
 
         // Hemispherical continuity check (Shortest Path interpolation)
         if (this.lastQuat) {
-            let dot = q.x*this.lastQuat.x + q.y*this.lastQuat.y + q.z*this.lastQuat.z + q.w*this.lastQuat.w;
+            let dot = q.x * this.lastQuat.x + q.y * this.lastQuat.y + q.z * this.lastQuat.z + q.w * this.lastQuat.w;
             if (dot < 0) {
                 q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w;
             }
         }
-        this.lastQuat = {x: q.x, y: q.y, z: q.z, w: q.w};
+        this.lastQuat = { x: q.x, y: q.y, z: q.z, w: q.w };
 
         return {
             x: this.x.filter(q.x, timestamp),
@@ -175,7 +176,7 @@ const loadThreeJS = async () => {
                 const { OrbitControls } = await import(new URL("./OrbitControls.js", baseUrl).href);
                 const { GLTFLoader } = await import(new URL("./GLTFLoader.js", baseUrl).href);
                 const { TransformControls } = await import(new URL("./TransformControls.js", baseUrl).href);
-                
+
                 resolve({ THREE, OrbitControls, GLTFLoader, TransformControls });
             } catch (e) {
                 console.error("[Mocap Surgeon] Critical Engine Load Failure:", e);
@@ -207,23 +208,34 @@ class MocapSurgeonViewport {
         this.node.properties = this.node.properties || {}; // Ensure properties object exists for serialization
         this.container = container;
         this.baseUrl = new URL(".", import.meta.url).href;
-        
+
         this.isInitialized = false;
         this.isPlaying = false;
+        this.isRecordingMode = false; // Distinguishes between AI processing and just watching playback
+
+        // --- Async Tracking Decoupling ---
+        this._trackingInFlight = false; // Prevents overlapping MediaPipe inference calls
+        this._pendingPose = null;       // Staging area for latest MP pose results
+        this._pendingHands = null;      // Staging area for latest MP hand results  
+        this._pendingFace = null;       // Staging area for latest MP face results
+        this._pendingTimestamp = 0;     // Video time that was being processed
+        this._lastProcessedVideoTimeMs = -1; // Track which video frame was last sent to MP
+        this._mpNeedsRestart = false;   // Recovery flag after MediaPipe crash
+        this._lastPlaybackFrame = -1;   // Skip redundant bone updates in playback mode
 
         this.scene = null;
         this.camera = null;
         this.renderer = null;
         this.controls = null;
         this.transformControls = null;
-        
+
         this.videoEl = null;
         this.canvasWrap = null;
         this.debugCanvas = null;
-        
+
         this.rig = null;
         this.mixer = null;
-        
+
         // Custom Scale-Independent Visualizers
         this.pickerGroup = null;
         this.customSkeletonGroup = null;
@@ -237,20 +249,20 @@ class MocapSurgeonViewport {
         this.handLandmarker = null;
         this.raycaster = null;
         this.zPlane = null;
-        
+
         this.motionData = {}; // Global Buffer to record Filtered Frame Data
         this.currentFrameIndex = null;
         this.isScrubbing = false;
-        
+
         // --- Interaction & UI States ---
         this.recordingIndicator = null;
         this.editedIndicator = null;
         this.timelineSlider = null;
         this.timeLabel = null;
         this.selectedMpIdx = null;
-        
+
         // --- Display Flags & Toggles ---
-        this.showOpenPose = true; 
+        this.showOpenPose = true;
         this.showGeoDepth = true; // New Toggle for the Character Mesh
         this.showSkeleton = true;
         this.showMPPoints = false;
@@ -260,47 +272,47 @@ class MocapSurgeonViewport {
         this.showOnionSkin = false;
         this.onionSkinLayers = 2; // Default to 2 frames before & after
         this.onionSkinStep = 3;   // Default to 3 frames between layers
-        
+
         // --- 1€ Filter States ---
         this.filterMinCutoff = 0.01;
         this.filterBeta = 20.0;
-        
+
         // Post-Math Rotation Filters
-        this.boneFilters = {}; 
-        this.hipsPosFilter = null; 
+        this.boneFilters = {};
+        this.hipsPosFilter = null;
 
         // PRE-MATH RAW LANDMARK FILTERS
         this.pose2DFilters = [];
         this.poseWorldFilters = [];
         this.handWorldFilters = { "Left": [], "Right": [] };
-        this.hand2DFilters = { "Left": [], "Right": [] }; 
+        this.hand2DFilters = { "Left": [], "Right": [] };
         this.face2DFilters = []; // The localized face double-filter was removed as it crushed points
-        
+
         this.mocapBones = {};
         this.baseRigShoulderWidth = 0.35;
         this.baseRigShoulderMidpoint = null;
-        
+
         this.lastVideoTimeMs = -1;
         this.mpClock = 0; // Monotonically increasing synthetic clock to prevent MediaPipe crashes
-        
+
         this.currentPose = null;
         this.currentHands = null;
         this.currentFace = null;
-        
+
         // Storage for 2D UI display
         this.smoothedPose2D = null;
         this.smoothedHands2D = [];
         this.smoothedFace2D = null;
 
         this.baseFaceLandmarks = null; // Cache to compute additive delta for face meshes
-        
+
         this.confidenceThreshold = 0.3; // Hardcoded fallback value
         this.rigScale = 1.0; // Hardcoded default scale
-        
+
         // EXPLICIT MAPPING TABLE: 
         // Direct body mapping for physically accurate representation
         this.MP_TO_MIXAMO = {
-            0:  ["mixamorigHead", "mixamorig_Head", "Mixamo:Head", "Head"],
+            0: ["mixamorigHead", "mixamorig_Head", "Mixamo:Head", "Head"],
             11: ["mixamorigLeftArm", "mixamorig_LeftArm", "Mixamo:LeftArm", "LeftArm"],             // Direct
             12: ["mixamorigRightArm", "mixamorig_RightArm", "Mixamo:RightArm", "RightArm"],         // Direct
             13: ["mixamorigLeftForeArm", "mixamorig_LeftForeArm", "Mixamo:LeftForeArm", "LeftForeArm"],   // Direct
@@ -326,15 +338,15 @@ class MocapSurgeonViewport {
             25: "LeftLeg", 26: "RightLeg", 27: "LeftFoot", 28: "RightFoot",
             99: "Hips", 901: "Spine", 902: "Spine1", 903: "Spine2"
         };
-        
+
         // EXACT MP FACE MAPPING (70 Points)
         this.MP_FACE_INDICES = [
-            162, 234, 93, 58, 172, 136, 149, 148, 152, 377, 378, 365, 397, 288, 323, 454, 389, 46, 53, 52, 
-            65, 55, 285, 295, 282, 283, 276, 6, 197, 195, 5, 98, 97, 2, 326, 327, 33, 160, 158, 133, 153, 144, 
-            362, 385, 387, 263, 373, 380, 61, 39, 37, 0, 267, 269, 291, 405, 314, 17, 84, 181, 78, 81, 13, 311, 
+            162, 234, 93, 58, 172, 136, 149, 148, 152, 377, 378, 365, 397, 288, 323, 454, 389, 46, 53, 52,
+            65, 55, 285, 295, 282, 283, 276, 6, 197, 195, 5, 98, 97, 2, 326, 327, 33, 160, 158, 133, 153, 144,
+            362, 385, 387, 263, 373, 380, 61, 39, 37, 0, 267, 269, 291, 405, 314, 17, 84, 181, 78, 81, 13, 311,
             308, 402, 14, 178, 468, 473
         ];
-        
+
         // EXPLICIT HAND TO MIXAMO MAPPING TABLE (Uses 100/200 series for internal ID tracking)
         // Hand Pose has 4 points per finger (Base, PIP, DIP, Tip). We extract 3 bone vectors from them.
         this.HAND_DICT = {
@@ -373,7 +385,7 @@ class MocapSurgeonViewport {
                 { id: 219, name: "LeftHandPinky3", p1: 19, p2: 20 }
             ]
         };
-        
+
         // Lines to draw on the debug overlay
         this.POSE_CONNECTIONS = [
             [11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [15, 19], [16, 20], // Upper body
@@ -406,8 +418,6 @@ class MocapSurgeonViewport {
             this.GLTFLoaderClass = libs.GLTFLoader;
             this.TransformControlsClass = libs.TransformControls;
             this.GLTFExporterClass = libs.GLTFExporter;
-
-            
 
             // Geometry Tools
             this.raycaster = new this.THREE.Raycaster();
@@ -472,8 +482,6 @@ class MocapSurgeonViewport {
             `;
             this.container.appendChild(style);
 
-            
-
             // Video Background
             this.videoEl = document.createElement("video");
             Object.assign(this.videoEl.style, {
@@ -484,9 +492,18 @@ class MocapSurgeonViewport {
                 zIndex: "1"
             });
             this.videoEl.playsInline = true;
-            this.videoEl.loop = true;
-            
-            // Sync play state if user clicks native video controls (optional)
+            this.videoEl.loop = false; // 1. Disable infinite looping
+
+            // 2. Safely auto-stop recording when the video finishes
+            this.videoEl.addEventListener('ended', () => {
+                if (this.isRecordingMode) {
+                    this.isRecordingMode = false;
+                    this.updatePlayState(false);
+                    console.log("[Mocap Surgeon] Reached end of video. Recording automatically finished.");
+                }
+            });
+
+            // Sync play state if user clicks native video controls
             this.videoEl.addEventListener('play', () => this.updatePlayState(true));
             this.videoEl.addEventListener('pause', () => this.updatePlayState(false));
 
@@ -520,22 +537,21 @@ class MocapSurgeonViewport {
             this.scene = new this.THREE.Scene();
 
             this.onionGroup = new this.THREE.Group();
-            
-            
+
             // --- NEW: LIGHTING SETUP FOR MESH VOLUME ---
             const ambientLight = new this.THREE.AmbientLight(0xffffff, 0.4);
             this.scene.add(ambientLight);
-            
+
             // Key Light
             const dirLight = new this.THREE.DirectionalLight(0xffffff, 1.5);
-            dirLight.position.set(0, 5, 5); 
+            dirLight.position.set(0, 5, 5);
             this.scene.add(dirLight);
 
             // Rim Light
             const backLight = new this.THREE.DirectionalLight(0xffffff, 0.5);
-            backLight.position.set(0, 2, -5); 
+            backLight.position.set(0, 2, -5);
             this.scene.add(backLight);
-            
+
             // Initialize Custom Visualizer Groups
             this.pickerGroup = new this.THREE.Group();
             this.customSkeletonGroup = new this.THREE.Group();
@@ -545,13 +561,13 @@ class MocapSurgeonViewport {
             this.camera = new this.THREE.PerspectiveCamera(45, 1, 0.01, 1000);
             this.camera.position.set(0, 1.2, 3);
 
-            this.renderer = new this.THREE.WebGLRenderer({ 
-                antialias: true, 
+            this.renderer = new this.THREE.WebGLRenderer({
+                antialias: true,
                 alpha: true // Enables transparent background
             });
             this.renderer.setClearColor(0x000000, 0); // Pure transparency
             if (this.renderer.outputColorSpace) this.renderer.outputColorSpace = this.THREE.SRGBColorSpace;
-            
+
             this.canvasWrap.appendChild(this.renderer.domElement);
             Object.assign(this.renderer.domElement.style, {
                 width: "100%",
@@ -571,15 +587,15 @@ class MocapSurgeonViewport {
             // Transform Controls (Manual Rig Override)
             this.transformControls = new this.TransformControlsClass(this.camera, this.renderer.domElement);
             // Default space is local for everything except Hips position which will be swapped dynamically
-            this.transformControls.setSpace('local'); 
+            this.transformControls.setSpace('local');
             this.scene.add(this.transformControls);
-            
+
             // Disable OrbitControls while dragging the Transform Gizmo
             this.transformControls.addEventListener('dragging-changed', (event) => {
                 this.controls.enabled = !event.value;
-                if (!event.value) { 
+                if (!event.value) {
                     // Fired when the user releases the mouse button from the gizmo
-                    this.saveManualEdit(); 
+                    this.saveManualEdit();
                 }
             });
 
@@ -590,21 +606,21 @@ class MocapSurgeonViewport {
 
             // Hotkeys: Frame Stepping, Premiere Range Selection & Gizmo 
             this.container.addEventListener('keydown', (e) => {
-                
+
                 // 1. Frame Stepping Logic
                 if (e.key === 'ArrowLeft' || e.key === ',') {
                     if (this.videoEl) {
                         if (!this.videoEl.paused) this.videoEl.pause();
-                        this.videoEl.currentTime = Math.max(0, this.videoEl.currentTime - (1/30));
+                        this.videoEl.currentTime = Math.max(0, this.videoEl.currentTime - (1 / 30));
                         this.node.properties.scrubbedTime = this.videoEl.currentTime;
                         this.node.properties.scrubbedFrame = Math.round(this.videoEl.currentTime * 30);
                     }
-                    return; 
+                    return;
                 }
                 if (e.key === 'ArrowRight' || e.key === '.') {
                     if (this.videoEl) {
                         if (!this.videoEl.paused) this.videoEl.pause();
-                        this.videoEl.currentTime = Math.min(this.videoEl.duration || Number.MAX_VALUE, this.videoEl.currentTime + (1/30));
+                        this.videoEl.currentTime = Math.min(this.videoEl.duration || Number.MAX_VALUE, this.videoEl.currentTime + (1 / 30));
                         this.node.properties.scrubbedTime = this.videoEl.currentTime;
                         this.node.properties.scrubbedFrame = Math.round(this.videoEl.currentTime * 30);
                     }
@@ -629,7 +645,7 @@ class MocapSurgeonViewport {
                     return;
                 }
 
-                // 3. Delete Data Hotkey (Safe from ComfyUI Node Deletion!)
+                // 3. Delete Data Hotkey
                 if (e.key === 'd' || e.key === 'D') {
                     this.deleteData();
                     return;
@@ -637,12 +653,12 @@ class MocapSurgeonViewport {
 
                 // 4. Transform Gizmo Hotkeys
                 if (!this.transformControls || !this.transformControls.object) return;
-                
+
                 if (e.key === 'r' || e.key === 'R') {
                     this.transformControls.setMode('rotate');
                     this.transformControls.setSpace('local');
                 } else if (e.key === 'g' || e.key === 'G') {
-                    if (this.selectedMpIdx == 99) { 
+                    if (this.selectedMpIdx == 99) {
                         this.transformControls.setMode('translate');
                         this.transformControls.setSpace('world');
                     }
@@ -653,36 +669,36 @@ class MocapSurgeonViewport {
             this.canvasWrap.addEventListener('pointerdown', (e) => {
                 // Only pick when the system is paused to avoid fighting tracking data
                 if (!this.videoEl.paused) return;
-                
+
                 // Do not interrupt raycasting if the user is already interacting with the Gizmo handles
                 if (this.transformControls.axis !== null) return;
 
                 const rect = this.canvasWrap.getBoundingClientRect();
                 const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
                 const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-                
+
                 this.raycaster.setFromCamera(new this.THREE.Vector2(x, y), this.camera);
                 const intersects = this.raycaster.intersectObjects(this.pickableObjects);
-                
+
                 // Reset all picker colors back to their native Visual-Side colors
                 this.pickableObjects.forEach(p => p.userData.baseColor && p.material.color.setHex(p.userData.baseColor));
 
                 if (intersects.length > 0) {
                     const selectedPicker = intersects[0].object;
                     this.selectedMpIdx = selectedPicker.userData.mpIdx;
-                    
+
                     // Highlight selected joint in pure white
                     selectedPicker.material.color.setHex(0xffffff);
 
                     this.transformControls.attach(this.mocapBones[this.selectedMpIdx]);
-                    
+
                     // Smart Gizmo Switcher: Hips gets Global Translate. Bones get Local Rotate.
                     if (this.selectedMpIdx == 99) {
                         this.transformControls.setMode('translate');
-                        this.transformControls.setSpace('world'); 
+                        this.transformControls.setSpace('world');
                     } else {
                         this.transformControls.setMode('rotate');
-                        this.transformControls.setSpace('local'); 
+                        this.transformControls.setSpace('local');
                     }
 
                     // NEW: Show panel when clicked
@@ -723,23 +739,23 @@ class MocapSurgeonViewport {
             this.visionLib = await import(visionUrl);
             const visionTask = await this.visionLib.FilesetResolver.forVisionTasks(this.baseUrl);
             const poseTaskUrl = new URL("./pose_landmarker_full.task", this.baseUrl).href;
-            
+
             this.poseLandmarker = await this.visionLib.PoseLandmarker.createFromOptions(visionTask, {
                 baseOptions: { modelAssetPath: poseTaskUrl, delegate: "GPU" },
                 runningMode: "VIDEO", numPoses: 1
             });
             console.log("[Mocap Surgeon] Pose Landmarker Ready.");
-            
+
             // Optional Detailed Task Models for Extremities
             const faceTaskUrl = new URL("./face_landmarker.task", this.baseUrl).href;
             const handTaskUrl = new URL("./hand_landmarker.task", this.baseUrl).href;
-            
+
             try {
                 this.faceLandmarker = await this.visionLib.FaceLandmarker.createFromOptions(visionTask, {
                     baseOptions: { modelAssetPath: faceTaskUrl, delegate: "GPU" },
                     runningMode: "VIDEO", numFaces: 1
                 });
-                
+
                 this.handLandmarker = await this.visionLib.HandLandmarker.createFromOptions(visionTask, {
                     baseOptions: { modelAssetPath: handTaskUrl, delegate: "GPU" },
                     runningMode: "VIDEO", numHands: 2
@@ -748,18 +764,16 @@ class MocapSurgeonViewport {
             } catch (e2) {
                 console.warn("[Mocap Surgeon] Optional Face/Hand models failed to load. Ensure .task files exist in the directory.", e2);
             }
-            
-        } catch(e) {
+
+        } catch (e) {
             console.error("[Mocap Surgeon] AI Boot failure. Ensure pose_landmarker_full.task is in the root.", e);
         }
     }
 
-    // NEW: Generalized Visibility Updater for Meshes
     updateMeshVisibility() {
         if (!this.rig) return;
         this.rig.traverse((child) => {
             if (child.isMesh || child.isSkinnedMesh) {
-                // Ensure the female geo body stays completely hidden to prevent overlap
                 if (child.name === "Geo_Depth_F") {
                     child.visible = false;
                     return;
@@ -772,11 +786,10 @@ class MocapSurgeonViewport {
                     curr = curr.parent;
                 }
                 const n = fullPath.replace(/[\s_]/g, '');
-                
+
                 if (n.includes("pose") || n.includes("openpose")) {
                     child.visible = this.showOpenPose;
                 } else {
-                    // Applies to Geo_Depth and any general character bodies
                     child.visible = this.showGeoDepth;
                 }
             }
@@ -833,7 +846,7 @@ class MocapSurgeonViewport {
             display: "none", flexDirection: "column", gap: "12px",
             boxShadow: "0 0 30px rgba(0, 210, 255, 0.4)", backdropFilter: "blur(8px)"
         });
-        
+
         this.helpModal.innerHTML = `
             <h2 style="color: #00d2ff; margin: 0 0 8px 0; border-bottom: 1px solid #333; padding-bottom: 8px;">Mocap Surgeon - Workflow Guide</h2>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
@@ -845,9 +858,9 @@ class MocapSurgeonViewport {
                     </ul>
                     <h4 style="color: #ffb020; margin: 12px 0 4px 0;">⚙️ STEP 2: PLAY & FILTER</h4>
                     <ul style="margin: 0; padding-left: 16px;">
-                        <li>Press <b>Play</b> to let the AI process and record the motion.</li>
-                        <li>Adjust <b>Base Smoothing</b> to remove shaking (lower values = heavier smoothing).</li>
-                        <li>Adjust <b>Action Speed</b> to help the rig catch up to fast punches without lagging.</li>
+                        <li>Press <b>🔴 Record</b> to let the AI process and capture the motion.</li>
+                        <li>Press <b>▶ Play Review</b> to watch your recording and edits smoothly.</li>
+                        <li>Adjust Smoothing and Action Speed while recording to tune AI responses.</li>
                     </ul>
                 </div>
                 <div>
@@ -889,7 +902,7 @@ class MocapSurgeonViewport {
             const lbl = document.createElement("span"); lbl.innerText = labelStr;
             const sld = document.createElement("input");
             sld.type = "range"; sld.min = min; sld.max = max; sld.step = step; sld.value = def;
-            sld.className = "mocap-theme-slider"; 
+            sld.className = "mocap-theme-slider";
             Object.assign(sld.style, { width: "60px" });
             const val = document.createElement("span"); val.innerText = def;
             sld.oninput = (e) => { val.innerText = e.target.value; onChange(parseFloat(e.target.value)); };
@@ -907,7 +920,6 @@ class MocapSurgeonViewport {
             return lbl;
         };
 
-        // --- NEW: VISUAL UI GROUPING FACTORY ---
         const buildStepBox = (titleText, color) => {
             const box = document.createElement("div");
             Object.assign(box.style, {
@@ -925,7 +937,7 @@ class MocapSurgeonViewport {
             return box;
         };
 
-        // --- TOP PANEL (Cleaned up Visual Toggles) ---
+        // --- TOP PANEL ---
         const topPanel = document.createElement("div");
         Object.assign(topPanel.style, {
             position: "absolute", top: "16px", left: "50%", transform: "translateX(-50%)",
@@ -937,7 +949,7 @@ class MocapSurgeonViewport {
         const tglOpenPose = buildToggle("OpenPose Proxy", this.showOpenPose, (v) => { this.showOpenPose = v; this.updateMeshVisibility(); });
         const tglGeoDepth = buildToggle("Character Mesh", this.showGeoDepth, (v) => { this.showGeoDepth = v; this.updateMeshVisibility(); });
         const tglMP = buildToggle("MP Points", this.showMPPoints, (v) => this.showMPPoints = v);
-        
+
         topPanel.append(tglGeoDepth, tglOpenPose, tglMP);
         this.container.appendChild(topPanel);
 
@@ -953,7 +965,11 @@ class MocapSurgeonViewport {
         const fileInput = document.createElement("input"); fileInput.type = "file"; fileInput.accept = "video/*"; fileInput.style.display = "none";
         const btnLoad = createBtn("📂 Load", "#2a2a2a");
         const btnSync = createBtn("🎥 Sync", "#006699");
-        this.btnPlay = createBtn("▶ Play", "#2d5a27");
+
+        // NEW SEPARATE PLAYBACK CONTROLS
+        this.btnRecord = createBtn("🔴 Record", "#8b0000");
+        this.btnPlayReview = createBtn("▶ Play Review", "#2d5a27");
+
         const sldCutoff = buildSlider("Base Smoothing (Lower=Stronger):", 0.001, 5.0, 0.01, 0.01, v => this.filterMinCutoff = v);
         const sldBeta = buildSlider("Action Speed (Higher=Snappier):", 0.0, 50.0, 0.1, 20.0, v => this.filterBeta = v);
 
@@ -964,35 +980,35 @@ class MocapSurgeonViewport {
         const tglFace = buildToggle("Face", this.trackFace, (v) => this.trackFace = v);
         step1Box.append(fileInput, btnLoad, btnSync, tglUpper, tglHands, tglFace);
 
-        // --- STEP 2: PLAYBACK & FILTERING ---
-        const step2Box = buildStepBox("STEP 2: PLAY & FILTER", "#ffb020");
-        step2Box.append(this.btnPlay, sldCutoff, sldBeta);
+        // --- STEP 2: RECORD & REVIEW ---
+        const step2Box = buildStepBox("STEP 2: RECORD & REVIEW", "#ffb020");
+        step2Box.append(this.btnRecord, this.btnPlayReview, sldCutoff, sldBeta);
 
         const topRows = document.createElement("div");
         Object.assign(topRows.style, { display: "flex", gap: "8px", width: "100%" });
         topRows.append(step1Box, step2Box);
 
-        // --- STEP 3: SURGERY (Grouped Edit Tools & Onion Skin) ---
+        // --- STEP 3: SURGERY ---
         const step3Box = buildStepBox("STEP 3: SURGERY", "#ff4444");
         Object.assign(step3Box.style, { flexDirection: "column", width: "100%" });
-        
+
         const surgeryToolsRow = document.createElement("div");
         Object.assign(surgeryToolsRow.style, { display: "flex", width: "100%", gap: "16px", justifyContent: "center", alignItems: "center", background: "rgba(0,0,0,0.3)", padding: "6px", borderRadius: "4px" });
-        
+
         const tglEditMode = buildToggle("Edit Mode", this.showSkeleton, (v) => {
             this.showSkeleton = v;
             if (this.customSkeletonGroup) this.customSkeletonGroup.visible = this.showSkeleton;
             if (this.pickerGroup) this.pickerGroup.visible = this.showSkeleton;
         });
-        tglEditMode.style.color = "#ff4444"; 
-        
+        tglEditMode.style.color = "#ff4444";
+
         const sepSurgery = document.createElement("div"); sepSurgery.innerText = " | "; Object.assign(sepSurgery.style, { color: "#666", fontWeight: "bold" });
-        
+
         const tglOnion = buildToggle("Onion Skin", this.showOnionSkin, (v) => this.showOnionSkin = v);
-        tglOnion.style.color = "#00d2ff"; 
+        tglOnion.style.color = "#00d2ff";
         const sldOnionLayers = buildSlider("Layers:", 1, 5, 1, 2, v => this.onionSkinLayers = v);
         const sldOnionStep = buildSlider("Step:", 1, 10, 1, 3, v => this.onionSkinStep = v);
-        
+
         surgeryToolsRow.append(tglEditMode, sepSurgery, tglOnion, sldOnionLayers, sldOnionStep);
 
         const rangeRow = document.createElement("div");
@@ -1007,11 +1023,11 @@ class MocapSurgeonViewport {
 
         const timelineRow = document.createElement("div");
         Object.assign(timelineRow.style, { display: "flex", width: "100%", gap: "8px", alignItems: "center" });
-        
+
         this.timeLabel = document.createElement("span");
         this.timeLabel.innerText = "0 / 0 f";
         Object.assign(this.timeLabel.style, { color: "#ccc", fontSize: "11px", minWidth: "70px", whiteSpace: "nowrap" });
-        
+
         this.timelineSlider = document.createElement("input");
         this.timelineSlider.type = "range"; this.timelineSlider.min = 0; this.timelineSlider.max = 100;
         this.timelineSlider.step = 0.01; this.timelineSlider.value = 0;
@@ -1033,7 +1049,12 @@ class MocapSurgeonViewport {
         this.sliderWrap.append(this.ticksContainer, this.timelineSlider);
 
         this.timelineSlider.oninput = (e) => {
+            if (!this.isScrubbing) {
+                // Just started scrubbing, reset MP state to avoid timestamp crashes
+                this._resetMpTimestamps();
+            }
             this.isScrubbing = true;
+            this._lastPlaybackFrame = -1;
             if (this.videoEl && !this.videoEl.paused) this.videoEl.pause();
             const scrubTime = parseFloat(e.target.value);
             if (this.videoEl) this.videoEl.currentTime = scrubTime;
@@ -1051,11 +1072,11 @@ class MocapSurgeonViewport {
         glbNameInput.type = "text"; glbNameInput.value = "Yedp_Clean_Mocap"; glbNameInput.className = "mocap-save-input";
         Object.assign(glbNameInput.style, { width: "140px" });
         const btnExport = createBtn("💾 Save to Action Director", "#800080");
-        
+
         btnExport.onclick = async () => {
             btnExport.innerText = "⏳ Baking..."; btnExport.style.background = "#555";
             const success = await this.exportToGLB(glbNameInput.value);
-            if (success) { btnExport.innerText = "✅ Saved!"; btnExport.style.background = "#008000"; } 
+            if (success) { btnExport.innerText = "✅ Saved!"; btnExport.style.background = "#008000"; }
             else { btnExport.innerText = "❌ Error"; btnExport.style.background = "#ff0000"; }
             setTimeout(() => { btnExport.innerText = "💾 Save to Action Director"; btnExport.style.background = "#800080"; }, 3000);
         };
@@ -1068,7 +1089,7 @@ class MocapSurgeonViewport {
         uiPanel.append(topRows, bottomRows);
         this.container.appendChild(uiPanel);
 
-        // --- RIGHT TRANSFORM PANEL (Unchanged) ---
+        // --- RIGHT TRANSFORM PANEL ---
         this.transformPanelEl = document.createElement("div");
         Object.assign(this.transformPanelEl.style, {
             position: "absolute", right: "16px", top: "50%", transform: "translateY(-50%)",
@@ -1110,11 +1131,11 @@ class MocapSurgeonViewport {
 
         // UI Events
         btnLoad.onclick = () => fileInput.click();
-        
+
         fileInput.onchange = (e) => {
             const file = e.target.files[0];
             if (!file) return;
-            
+
             this.motionData = {};
             if (this.ticksContainer) {
                 const existingTicks = this.ticksContainer.querySelectorAll('.mocap-tick');
@@ -1124,42 +1145,85 @@ class MocapSurgeonViewport {
             this.hipsPosFilter = null;
             this.baseFaceLandmarks = null;
             this.currentFrameIndex = 0;
+            this.isRecordingMode = false;
 
             this.pose2DFilters = [];
             this.poseWorldFilters = [];
             this.handWorldFilters = { "Left": [], "Right": [] };
             this.hand2DFilters = { "Left": [], "Right": [] };
             this.face2DFilters = [];
-            
-            this.lastVideoTimeMs = -1; 
-            
+
+            this.lastVideoTimeMs = -1;
+
             if (this.videoEl.src && this.videoEl.src.startsWith('blob:')) {
                 URL.revokeObjectURL(this.videoEl.src);
             }
-            
+
             this.videoEl.src = URL.createObjectURL(file);
             this.videoEl.onloadedmetadata = () => {
                 console.log(`[Mocap Surgeon] Loaded video: ${file.name}`);
                 if (this.timelineSlider) this.timelineSlider.max = this.videoEl.duration;
-                
+
                 if (this.node.properties && this.node.properties.scrubbedTime !== undefined) {
                     if (this.node.properties.scrubbedTime <= this.videoEl.duration) {
                         this.videoEl.currentTime = this.node.properties.scrubbedTime;
                         this.timelineSlider.value = this.node.properties.scrubbedTime;
                     }
                 }
-                this.syncCamera(); 
+                this.syncCamera();
             };
         };
 
         btnSync.onclick = () => this.syncCamera();
 
-        this.btnPlay.onclick = () => {
+        // Separate Record Button Logic
+        this.btnRecord.onclick = async () => {
             if (this.videoEl.paused) {
-                this.videoEl.play();
+                this.isRecordingMode = true;
+                this._lastPlaybackFrame = -1;
+
+                // --- THE WARM-UP FIX ---
+                this.btnRecord.innerText = "⏳ Warming Up...";
+                this.btnRecord.style.background = "#555";
+
+                // Force a single frame through the AI to load models into the GPU memory
+                // BEFORE we let the video start playing natively.
+                if (this.poseLandmarker && this.videoEl.readyState >= 2) {
+                    try {
+                        let mpTimestamp = performance.now();
+                        if (this.lastMpTimestamp !== undefined && mpTimestamp <= this.lastMpTimestamp) {
+                            mpTimestamp = this.lastMpTimestamp + 0.1;
+                        }
+                        this.lastMpTimestamp = mpTimestamp;
+                        this.poseLandmarker.detectForVideo(this.videoEl, mpTimestamp);
+                    } catch (e) { console.warn("Warmup skip", e); }
+                }
+
+                // Now start the video (tracking will immediately catch frame 0)
+                this.updatePlayState(true);
+                const playPromise = this.videoEl.play();
+                if (playPromise !== undefined) playPromise.catch(e => console.warn("[Mocap Surgeon] Record Play interrupted:", e));
+            } else {
+                // Pausing
+                this.videoEl.pause();
+                this.updatePlayState(false);
+                if (this.videoEl) {
+                    this.node.properties.scrubbedTime = this.videoEl.currentTime;
+                    this.node.properties.scrubbedFrame = Math.round(this.videoEl.currentTime * 30);
+                }
+            }
+        };
+
+        // Separate Play Review Logic (Bypasses MP inference entirely)
+        this.btnPlayReview.onclick = () => {
+            if (this.videoEl.paused) {
+                this.isRecordingMode = false; // Explicitly disable recording
+                this._lastPlaybackFrame = -1;
+                const playPromise = this.videoEl.play();
+                if (playPromise !== undefined) playPromise.catch(e => console.warn("[Mocap Surgeon] Playback interrupted:", e));
             } else {
                 this.videoEl.pause();
-                // Ensure exact paused frame is captured in serialization
+                this.isRecordingMode = false; // Explicitly disable recording
                 if (this.videoEl) {
                     this.node.properties.scrubbedTime = this.videoEl.currentTime;
                     this.node.properties.scrubbedFrame = Math.round(this.videoEl.currentTime * 30);
@@ -1170,15 +1234,40 @@ class MocapSurgeonViewport {
 
     updatePlayState(isPlaying) {
         this.isPlaying = isPlaying;
-        if (this.btnPlay) {
-            this.btnPlay.innerText = isPlaying ? "⏸ Pause" : "▶ Play";
-            this.btnPlay.style.background = isPlaying ? "#5a2727" : "#2d5a27";
+        // NOTE: We no longer auto-reset isRecordingMode on pause.
+        // Recording intent is only changed by explicit user action (Record/Review buttons).
+
+        if (this.btnRecord && this.btnPlayReview) {
+            if (isPlaying) {
+                if (this.isRecordingMode) {
+                    this.btnRecord.innerText = "⏸ Pause Rec";
+                    this.btnRecord.style.background = "#5a2727";
+                    this.btnPlayReview.innerText = "▶ Play Review";
+                    this.btnPlayReview.style.background = "#2d5a27";
+                } else {
+                    this.btnPlayReview.innerText = "⏸ Pause Review";
+                    this.btnPlayReview.style.background = "#5a2727";
+                    this.btnRecord.innerText = "🔴 Record";
+                    this.btnRecord.style.background = "#8b0000";
+                }
+            } else {
+                // Show paused state but preserve the mode intent
+                if (this.isRecordingMode) {
+                    this.btnRecord.innerText = "🔴 Resume Rec";
+                    this.btnRecord.style.background = "#8b0000";
+                } else {
+                    this.btnRecord.innerText = "🔴 Record";
+                    this.btnRecord.style.background = "#8b0000";
+                }
+                this.btnPlayReview.innerText = "▶ Play Review";
+                this.btnPlayReview.style.background = "#2d5a27";
+            }
         }
     }
 
     async loadRig() {
         const rigUrl = new URL(`../Yedp_Rig.glb?t=${Date.now()}`, this.baseUrl).href;
-        
+
         try {
             console.log("[Mocap Surgeon] Loading reference rig from:", rigUrl);
             const model = await new this.GLTFLoaderClass().loadAsync(rigUrl);
@@ -1186,40 +1275,31 @@ class MocapSurgeonViewport {
             this.mocapBones = {};
             this.pickableObjects = [];
             this.boneCylinders = [];
-            
-            // PRE-FLIGHT TRANSFORMATION RESET: Lock the rig to cleanly face the camera
-            this.rig.rotation.set(0, Math.PI, 0); 
+
+            this.rig.rotation.set(0, Math.PI, 0);
             this.rig.updateMatrixWorld(true);
-            
+
             console.log("---- [Mocap Surgeon] RIG BONE AUDIT START ----");
 
-            // Utility to extract Side Color based on the SWAPPED Upper / SWAPPED Lower mapping
             const getSideColor = (idx) => {
                 const i = parseInt(idx);
-                // Visual Left of Screen (Muted Gray-Red)
-                if ([12, 14, 16, 24, 26, 28].includes(i)) return 0x886666; 
-                // Visual Right of Screen (Muted Gray-Blue)
-                if ([11, 13, 15, 23, 25, 27].includes(i)) return 0x666688; 
-                // Center Spine (Muted Gray-Green)
-                return 0x668866; 
+                if ([12, 14, 16, 24, 26, 28].includes(i)) return 0x886666;
+                if ([11, 13, 15, 23, 25, 27].includes(i)) return 0x666688;
+                return 0x668866;
             };
 
-            // Define Global-Space Geometry for Raycasting Joints (Independent of Bone Scale)
             const pickerGeo = new this.THREE.SphereGeometry(0.04, 12, 12);
 
             this.rig.traverse((child) => {
-                
                 if (child.isBone) {
                     let mapped = false;
-                    
-                    // 1. Core Body Mapping
                     for (const [mpIdx, boneNames] of Object.entries(this.MP_TO_MIXAMO)) {
                         if (!mapped && boneNames.some(bn => child.name === bn || child.name.endsWith(bn))) {
                             this.mocapBones[mpIdx] = child;
                             mapped = true;
-                            
+
                             const jointColor = getSideColor(mpIdx);
-                            const pickerMat = new this.THREE.MeshBasicMaterial({ 
+                            const pickerMat = new this.THREE.MeshBasicMaterial({
                                 color: jointColor, transparent: true, opacity: 0.8, depthTest: false, depthWrite: false
                             });
                             const picker = new this.THREE.Mesh(pickerGeo, pickerMat);
@@ -1229,22 +1309,20 @@ class MocapSurgeonViewport {
                             this.pickableObjects.push(picker);
                         }
                     }
-                    
-                    // 2. Face Mapping (70 Bones)
+
                     if (!mapped && child.name.includes("OP_Face_")) {
                         const match = child.name.match(/OP_Face_(\d+)/);
                         if (match) {
                             const fIdx = parseInt(match[1]);
                             if (fIdx >= 0 && fIdx < 70) {
-                                const faceId = 300 + fIdx; // 300-series namespace for Face Bones
+                                const faceId = 300 + fIdx;
                                 this.mocapBones[faceId] = child;
                                 this.BONE_EXPORT_NAMES[faceId] = `OP_Face_${fIdx}`;
                                 mapped = true;
                             }
                         }
                     }
-                    
-                    // 3. Hand Mapping
+
                     if (!mapped) {
                         ["Left", "Right"].forEach(side => {
                             this.HAND_DICT[side].forEach(finger => {
@@ -1257,26 +1335,23 @@ class MocapSurgeonViewport {
                         });
                     }
                 }
-                
+
                 if (child.isMesh || child.isSkinnedMesh) {
-                    child.frustumCulled = false; // Disable frustum culling to prevent mesh disappearing on camera rotation
-                    
-                    // Apply Action Director's robust material translation logic universally with an upgrade to Standard Material
+                    child.frustumCulled = false;
+
                     const processMat = (mat) => {
                         const oldColor = mat.color || new this.THREE.Color(0xffffff);
-                        // Upgrade to MeshStandardMaterial so it interacts with the new lighting system
-                        const newMat = new this.THREE.MeshStandardMaterial({ 
+                        const newMat = new this.THREE.MeshStandardMaterial({
                             color: oldColor,
                             roughness: 0.6,
                             metalness: 0.1
                         });
-                        
-                        if (mat.map) { 
-                            newMat.map = mat.map; 
-                            newMat.color.setHex(0xffffff); 
+
+                        if (mat.map) {
+                            newMat.map = mat.map;
+                            newMat.color.setHex(0xffffff);
                         }
-                        
-                        // Force solid mesh rendering for better depth perception
+
                         newMat.transparent = false;
                         newMat.opacity = 1.0;
                         newMat.depthWrite = true;
@@ -1291,24 +1366,19 @@ class MocapSurgeonViewport {
                     }
                 }
             });
-            
-            // Sync initial visibility based on UI defaults
-            this.updateMeshVisibility();
 
+            this.updateMeshVisibility();
             console.log("---- [Mocap Surgeon] RIG BONE AUDIT END ----");
 
-            // --- Construct Custom Thick Skeleton Connectors ---
             const cylGeo = new this.THREE.CylinderGeometry(0.015, 0.015, 1, 8);
-            // Center pivot to bottom so it stretches cleanly between two joints
-            cylGeo.translate(0, 0.5, 0); 
-            
+            cylGeo.translate(0, 0.5, 0);
+
             this.BONE_CONNECTIONS.forEach(([idx1, idx2]) => {
-                // Color matches the origin joint
                 const color = getSideColor(idx1);
-                const mat = new this.THREE.MeshBasicMaterial({ 
-                    color: color, 
-                    transparent: true, opacity: 0.9, 
-                    depthTest: false, depthWrite: false 
+                const mat = new this.THREE.MeshBasicMaterial({
+                    color: color,
+                    transparent: true, opacity: 0.9,
+                    depthTest: false, depthWrite: false
                 });
                 const mesh = new this.THREE.Mesh(cylGeo, mat);
                 this.customSkeletonGroup.add(mesh);
@@ -1316,11 +1386,10 @@ class MocapSurgeonViewport {
             });
 
             this.scene.add(this.rig);
-            this.rig.add(this.onionGroup); // Fix: Onion skin now perfectly aligns with the rig!
-            
-            // Critical Pre-measurement: Find true Rest-Pose shoulder distance and midpoint before the raycaster rips the hierarchy
+            this.rig.add(this.onionGroup);
+
             this.rig.updateMatrixWorld(true);
-            
+
             if (this.mocapBones[11] && this.mocapBones[12]) {
                 const lPos = new this.THREE.Vector3(); this.mocapBones[11].getWorldPosition(lPos);
                 const rPos = new this.THREE.Vector3(); this.mocapBones[12].getWorldPosition(rPos);
@@ -1329,13 +1398,11 @@ class MocapSurgeonViewport {
                 console.log(`[Mocap Surgeon] Calibrated Rig Base Shoulder Width: ${this.baseRigShoulderWidth.toFixed(4)}`);
             }
 
-            // Save standard local "T-Pose" vectors for Soft Presence interpolation
             for (const [mpIdx, bone] of Object.entries(this.mocapBones)) {
                 bone.userData.restQuaternion = bone.quaternion.clone();
                 bone.userData.restPosition = bone.position.clone();
             }
 
-            // Bind animation mixer if the rig contains embedded tracks
             this.mixer = new this.THREE.AnimationMixer(this.rig);
             if (model.animations && model.animations.length > 0) {
                 const action = this.mixer.clipAction(model.animations[0]);
@@ -1347,31 +1414,27 @@ class MocapSurgeonViewport {
         }
     }
 
-    // --- NEW: TRANSFORM PANEL LOGIC ---
     updateTransformPanelUI() {
         if (!this.selectedMpIdx || !this.mocapBones[this.selectedMpIdx]) {
             if (this.transformPanelEl) this.transformPanelEl.style.display = "none";
             return;
         }
-        
+
         if (this.transformPanelEl) this.transformPanelEl.style.display = "flex";
-        
+
         const bone = this.mocapBones[this.selectedMpIdx];
         const ui = this.uiTransformInputs;
         if (!ui || !ui.px) return;
 
-        // Update Position Inputs
         ui.px.value = bone.position.x.toFixed(3);
         ui.py.value = bone.position.y.toFixed(3);
         ui.pz.value = bone.position.z.toFixed(3);
 
-        // Update Rotation Inputs (Converted from Quaternion to Euler Degrees)
         const euler = new this.THREE.Euler().setFromQuaternion(bone.quaternion);
         ui.rx.value = this.THREE.MathUtils.radToDeg(euler.x).toFixed(1);
         ui.ry.value = this.THREE.MathUtils.radToDeg(euler.y).toFixed(1);
         ui.rz.value = this.THREE.MathUtils.radToDeg(euler.z).toFixed(1);
-        
-        // Lock translation fields if it's not the Hips
+
         const isHips = (this.selectedMpIdx == 99);
         ui.px.disabled = !isHips; ui.py.disabled = !isHips; ui.pz.disabled = !isHips;
         ui.px.style.opacity = isHips ? "1.0" : "0.3";
@@ -1381,29 +1444,26 @@ class MocapSurgeonViewport {
 
     applyManualTransformFromUI() {
         if (!this.selectedMpIdx || !this.mocapBones[this.selectedMpIdx]) return;
-        
+
         const bone = this.mocapBones[this.selectedMpIdx];
         const ui = this.uiTransformInputs;
-        
-        if (this.selectedMpIdx == 99) { // Only allow position changes for Hips
-            bone.position.set(parseFloat(ui.px.value)||0, parseFloat(ui.py.value)||0, parseFloat(ui.pz.value)||0);
+
+        if (this.selectedMpIdx == 99) {
+            bone.position.set(parseFloat(ui.px.value) || 0, parseFloat(ui.py.value) || 0, parseFloat(ui.pz.value) || 0);
         }
-        
-        // Convert Euler Degrees back to Quaternion
-        const rx = this.THREE.MathUtils.degToRad(parseFloat(ui.rx.value)||0);
-        const ry = this.THREE.MathUtils.degToRad(parseFloat(ui.ry.value)||0);
-        const rz = this.THREE.MathUtils.degToRad(parseFloat(ui.rz.value)||0);
+
+        const rx = this.THREE.MathUtils.degToRad(parseFloat(ui.rx.value) || 0);
+        const ry = this.THREE.MathUtils.degToRad(parseFloat(ui.ry.value) || 0);
+        const rz = this.THREE.MathUtils.degToRad(parseFloat(ui.rz.value) || 0);
         bone.quaternion.setFromEuler(new this.THREE.Euler(rx, ry, rz));
-        
+
         bone.updateMatrixWorld(true);
-        this.saveManualEdit(); // Trigger your built-in Slerp bake!
+        this.saveManualEdit();
     }
 
-    // --- NEW: TIMELINE TICKS LOGIC ---
     updateTimelineTicks() {
         if (!this.ticksContainer || !this.videoEl || isNaN(this.videoEl.duration) || this.videoEl.duration === 0) return;
 
-        // SAFE CLEAR: Only delete the orange ticks, do not destroy the Blue Range Box!
         const existingTicks = this.ticksContainer.querySelectorAll('.mocap-tick');
         existingTicks.forEach(t => t.remove());
 
@@ -1416,51 +1476,40 @@ class MocapSurgeonViewport {
                 const percent = (fIdx / totalFrames) * 100;
 
                 const tick = document.createElement("div");
-                tick.className = "mocap-tick"; // TAG IT SO IT CAN BE SAFELY REMOVED LATER
+                tick.className = "mocap-tick";
                 Object.assign(tick.style, {
-                    position: "absolute",
-                    left: `${percent}%`,
-                    top: "14px", 
-                    width: "2px",
-                    height: "6px",
-                    backgroundColor: "#ffa500", 
-                    transform: "translateX(-50%)",
-                    borderRadius: "1px"
+                    position: "absolute", left: `${percent}%`, top: "14px",
+                    width: "2px", height: "6px", backgroundColor: "#ffa500",
+                    transform: "translateX(-50%)", borderRadius: "1px"
                 });
                 this.ticksContainer.appendChild(tick);
             }
         }
     }
 
-    // --- NEW: TIME-TRAVEL ONION SKIN ENGINE (OPTIMIZED + RED/GREEN) ---
     drawOnionSkin() {
         if (!this.onionGroup) return;
-        
-        // 1. PERFORMANCE LOCK: Instant exit if disabled or playing
+
         if (!this.showOnionSkin || this.currentFrameIndex === null || (this.videoEl && !this.videoEl.paused)) {
-            if (this.onionGroup.children.length > 0) this.onionGroup.clear(); // Safe native clear
+            if (this.onionGroup.children.length > 0) this.onionGroup.clear();
             this.wasShowingOnion = false;
             return;
         }
 
-        // Force refresh if the UI toggle was just turned on
         if (!this.wasShowingOnion) {
             this.lastOnionFrame = -1;
             this.wasShowingOnion = true;
         }
 
-        // 2. PERFORMANCE LOCK: Only recalculate if we changed frames or are actively dragging a joint!
         const isDragging = this.transformControls && this.transformControls.dragging;
         if (this.currentFrameIndex === this.lastOnionFrame && !isDragging) {
-            return; // Skip heavy math, keep displaying cached onion layers!
+            return;
         }
         this.lastOnionFrame = this.currentFrameIndex;
 
-        // Ensure it's safely in the global scene for accurate World Space coordinates
         if (this.onionGroup.parent !== this.scene) this.scene.add(this.onionGroup);
         this.onionGroup.clear();
 
-        // 1. SAVE CURRENT RIG STATE
         const backupState = {};
         for (const [mpIdx, bone] of Object.entries(this.mocapBones)) {
             backupState[mpIdx] = {
@@ -1475,24 +1524,22 @@ class MocapSurgeonViewport {
             const frameData = this.motionData[fIdx];
             if (!frameData || !frameData.bones) return;
 
-            // 2. TIME TRAVEL: INSTANTLY APPLY PAST FRAME TO RIG
             for (const [mpIdx, dat] of Object.entries(frameData.bones)) {
                 const bone = this.mocapBones[mpIdx];
                 if (!bone || !dat) continue;
 
-                if (parseInt(mpIdx) >= 300 && parseInt(mpIdx) <= 369) { 
+                if (parseInt(mpIdx) >= 300 && parseInt(mpIdx) <= 369) {
                     if (dat.posX !== undefined) bone.position.set(dat.posX, dat.posY, dat.posZ);
-                } else { 
+                } else {
                     if (dat.x !== undefined) bone.quaternion.set(dat.x, dat.y, dat.z, dat.w);
                 }
             }
             if (frameData.hipsPos && this.mocapBones[99]) {
                 this.mocapBones[99].position.set(frameData.hipsPos.x, frameData.hipsPos.y, frameData.hipsPos.z);
             }
-            
+
             this.rig.updateMatrixWorld(true);
 
-            // 3. READ TRUE 3D WORLD POSITIONS
             const worldPositions = {};
             [99, 901, 902, 903, 0, 11, 13, 15, 12, 14, 16, 23, 25, 27, 24, 26, 28].forEach(idx => {
                 if (this.mocapBones[idx]) {
@@ -1500,9 +1547,8 @@ class MocapSurgeonViewport {
                 }
             });
 
-            // 4. DRAW GLOWING DOTS AND LINES IN WORLD SPACE
             const material = new this.THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity: opacity, depthTest: false, depthWrite: false });
-            
+
             for (let i in worldPositions) {
                 let dot = new this.THREE.Mesh(dotGeo, material);
                 dot.position.copy(worldPositions[i]);
@@ -1531,20 +1577,16 @@ class MocapSurgeonViewport {
             return null;
         };
 
-        // Draw Past (Bright Red)
         for (let i = 1; i <= this.onionSkinLayers; i++) {
             let actualF = getNearestFrame(this.currentFrameIndex - (i * this.onionSkinStep));
-            // Drops opacity by 35% per step, flooring at 15% visibility
-            if (actualF !== null) drawSkeleton(actualF, 0xff0000, Math.max(0.15, 1.0 - (i * 0.35))); 
+            if (actualF !== null) drawSkeleton(actualF, 0xff0000, Math.max(0.15, 1.0 - (i * 0.35)));
         }
 
-        // Draw Future (Bright Green)
         for (let i = 1; i <= this.onionSkinLayers; i++) {
             let actualF = getNearestFrame(this.currentFrameIndex + (i * this.onionSkinStep));
-            if (actualF !== null) drawSkeleton(actualF, 0x00ff00, Math.max(0.15, 1.0 - (i * 0.35))); 
+            if (actualF !== null) drawSkeleton(actualF, 0x00ff00, Math.max(0.15, 1.0 - (i * 0.35)));
         }
 
-        // 5. BACK TO THE PRESENT: RESTORE CURRENT RIG STATE
         for (const [mpIdx, state] of Object.entries(backupState)) {
             const bone = this.mocapBones[mpIdx];
             if (bone) {
@@ -1554,39 +1596,34 @@ class MocapSurgeonViewport {
         }
         this.rig.updateMatrixWorld(true);
     }
-             
 
-    // --- MANUAL EDIT BLENDER ALGORITHM ---
     saveManualEdit() {
         if (!this.selectedMpIdx || this.currentFrameIndex === null) return;
-        
+
         let mpIdx = this.selectedMpIdx;
         let frameIdx = this.currentFrameIndex;
-        
+
         if (!this.motionData[frameIdx]) this.motionData[frameIdx] = { bones: {} };
         if (!this.motionData[frameIdx].bones[mpIdx]) this.motionData[frameIdx].bones[mpIdx] = {};
 
         const bone = this.mocapBones[mpIdx];
         const quat = bone.quaternion;
-        
-        this.motionData[frameIdx].hasManualEdits = true; 
-        this.motionData[frameIdx].bones[mpIdx].isManual = true; 
-        
-        // --- NEW: BACKUP PRISTINE AI DATA BEFORE OVERWRITING ---
+
+        this.motionData[frameIdx].hasManualEdits = true;
+        this.motionData[frameIdx].bones[mpIdx].isManual = true;
+
         let bDat = this.motionData[frameIdx].bones[mpIdx];
         if (bDat.baseX === undefined && bDat.x !== undefined) {
-            bDat.baseX = bDat.x; bDat.baseY = bDat.y; bDat.baseZ = bDat.z; 
+            bDat.baseX = bDat.x; bDat.baseY = bDat.y; bDat.baseZ = bDat.z;
             if (bDat.w !== undefined) bDat.baseW = bDat.w;
         }
 
-        // Save explicit overwrite values
         bDat.x = quat.x; bDat.y = quat.y; bDat.z = quat.z; bDat.w = quat.w;
-        
-        // If Hips, also explicitly save position
+
         if (mpIdx == 99) {
-            if(!this.motionData[frameIdx].hipsPos) this.motionData[frameIdx].hipsPos = {};
+            if (!this.motionData[frameIdx].hipsPos) this.motionData[frameIdx].hipsPos = {};
             let hDat = this.motionData[frameIdx].hipsPos;
-            
+
             if (hDat.baseX === undefined && hDat.x !== undefined) {
                 hDat.baseX = hDat.x; hDat.baseY = hDat.y; hDat.baseZ = hDat.z;
             }
@@ -1594,96 +1631,190 @@ class MocapSurgeonViewport {
             hDat.isManual = true;
         }
 
-        // Trigger the Slerp!
         this.performBlendAt(frameIdx, mpIdx);
 
-        this.updateTimelineTicks(); 
-        this.lastOnionFrame = -1; // Force Onion Skin redraw
+        this.updateTimelineTicks();
+        this.lastOnionFrame = -1;
     }
 
-    // --- NEW: MODULAR BLEND ENGINE ---
     performBlendAt(frameIdx, mpIdx) {
         const BLEND_FRAMES = 10;
-        const sourceFrame = this.motionData[frameIdx];
-        if (!sourceFrame || !sourceFrame.bones[mpIdx] || !sourceFrame.bones[mpIdx].isManual) return;
+        const keysArray = Object.keys(this.motionData).map(Number);
+        const totalFrames = keysArray.length > 0 ? Math.max(...keysArray) : 0;
 
-        const manData = sourceFrame.bones[mpIdx];
-        const manQuat = new this.THREE.Quaternion(manData.x, manData.y, manData.z, manData.w);
-        
-        let manPos = null;
-        if (mpIdx == 99 && sourceFrame.hipsPos && sourceFrame.hipsPos.isManual) {
-            manPos = new this.THREE.Vector3(sourceFrame.hipsPos.x, sourceFrame.hipsPos.y, sourceFrame.hipsPos.z);
-        }
-
-        const sweep = (directionMultiplier) => {
-            for (let i = 1; i <= BLEND_FRAMES; i++) {
-                let f = frameIdx + (i * directionMultiplier);
-                
-                // Break if we hit empty data space or another manual keyframe boundary
-                if (!this.motionData[f] || !this.motionData[f].bones[mpIdx]) break; 
-                if (this.motionData[f].bones[mpIdx].isManual) break; 
-                
-                let targetRaw = this.motionData[f].bones[mpIdx];
-                
-                // Backup pristine AI data before modifying
-                if (targetRaw.baseX === undefined && targetRaw.x !== undefined) {
-                    targetRaw.baseX = targetRaw.x; targetRaw.baseY = targetRaw.y; targetRaw.baseZ = targetRaw.z; 
-                    if (targetRaw.w !== undefined) targetRaw.baseW = targetRaw.w;
-                }
-                
-                // Blend Quaternions
-                if (targetRaw.baseW !== undefined && manQuat.x !== undefined) {
-                    let targetQ = new this.THREE.Quaternion(targetRaw.baseX, targetRaw.baseY, targetRaw.baseZ, targetRaw.baseW);
-                    let t = i / (BLEND_FRAMES + 1);
-                    let blended = new this.THREE.Quaternion().copy(manQuat).slerp(targetQ, t); 
-                    
-                    targetRaw.x = blended.x; targetRaw.y = blended.y; targetRaw.z = blended.z; targetRaw.w = blended.w;
-                    targetRaw.isBlended = true;
-                    this.motionData[f].hasManualEdits = true; 
-                }
-                
-                // Blend Position (Hips Only)
-                if (mpIdx == 99 && manPos && this.motionData[f].hipsPos) {
-                    let targetPDat = this.motionData[f].hipsPos;
-                    if (targetPDat.baseX === undefined && targetPDat.x !== undefined) {
-                        targetPDat.baseX = targetPDat.x; targetPDat.baseY = targetPDat.y; targetPDat.baseZ = targetPDat.z;
+        let manualKeys = [];
+        for (let f = 0; f <= totalFrames; f++) {
+            if (this.motionData[f] && this.motionData[f].bones[mpIdx]) {
+                const bData = this.motionData[f].bones[mpIdx];
+                if (bData.isManual) {
+                    manualKeys.push(f);
+                } else if (bData.isBlended) {
+                    if (bData.baseX !== undefined) {
+                        bData.x = bData.baseX; bData.y = bData.baseY; bData.z = bData.baseZ;
+                        if (bData.baseW !== undefined) bData.w = bData.baseW;
                     }
-                    if (targetPDat.baseX !== undefined) {
-                        let targetP = new this.THREE.Vector3(targetPDat.baseX, targetPDat.baseY, targetPDat.baseZ);
-                        let t = i / (BLEND_FRAMES + 1);
-                        let blendedP = new this.THREE.Vector3().copy(manPos).lerp(targetP, t); 
-                        
-                        targetPDat.x = blendedP.x; targetPDat.y = blendedP.y; targetPDat.z = blendedP.z;
-                        targetPDat.isBlended = true;
-                    }
+                    bData.isBlended = false;
                 }
             }
+            if (mpIdx == 99 && this.motionData[f] && this.motionData[f].hipsPos) {
+                const pDat = this.motionData[f].hipsPos;
+                if (!pDat.isManual && pDat.isBlended) {
+                    if (pDat.baseX !== undefined) {
+                        pDat.x = pDat.baseX; pDat.y = pDat.baseY; pDat.z = pDat.baseZ;
+                    }
+                    pDat.isBlended = false;
+                }
+            }
+        }
+
+        const getRawQuat = (f) => {
+            const b = this.motionData[f].bones[mpIdx];
+            if (b.baseX !== undefined) return new this.THREE.Quaternion(b.baseX, b.baseY, b.baseZ, b.baseW);
+            return new this.THREE.Quaternion(b.x, b.y, b.z, b.w);
+        };
+        const getManQuat = (f) => {
+            const b = this.motionData[f].bones[mpIdx];
+            return new this.THREE.Quaternion(b.x, b.y, b.z, b.w);
+        };
+        const getRawPos = (f) => {
+            const p = this.motionData[f].hipsPos;
+            if (p.baseX !== undefined) return new this.THREE.Vector3(p.baseX, p.baseY, p.baseZ);
+            return new this.THREE.Vector3(p.x, p.y, p.z);
+        };
+        const getManPos = (f) => {
+            const p = this.motionData[f].hipsPos;
+            return new this.THREE.Vector3(p.x, p.y, p.z);
         };
 
-        sweep(1);  // Forward
-        sweep(-1); // Backward
+        for (let i = 0; i < manualKeys.length; i++) {
+            const mk = manualKeys[i];
+            const qMan = getManQuat(mk);
+            const qRaw = getRawQuat(mk);
+            const qOffsetA = qRaw.clone().invert().multiply(qMan);
+
+            let pOffsetA = null;
+            if (mpIdx == 99 && this.motionData[mk].hipsPos && this.motionData[mk].hipsPos.isManual) {
+                pOffsetA = getManPos(mk).clone().sub(getRawPos(mk));
+            }
+
+            const nextMK = i < manualKeys.length - 1 ? manualKeys[i + 1] : null;
+            const forwardDist = nextMK !== null ? nextMK - mk : 999999;
+
+            if (nextMK !== null && forwardDist <= BLEND_FRAMES * 2) {
+                const qOffsetB = getRawQuat(nextMK).clone().invert().multiply(getManQuat(nextMK));
+                let pOffsetB = null;
+                if (mpIdx == 99 && this.motionData[nextMK].hipsPos && this.motionData[nextMK].hipsPos.isManual) {
+                    pOffsetB = getManPos(nextMK).clone().sub(getRawPos(nextMK));
+                }
+
+                for (let d = 1; d < forwardDist; d++) {
+                    let f = mk + d;
+                    if (!this.motionData[f] || !this.motionData[f].bones[mpIdx]) continue;
+                    let t = d / forwardDist;
+                    let currentOffset = new this.THREE.Quaternion().copy(qOffsetA).slerp(qOffsetB, t);
+                    let finalQ = getRawQuat(f).clone().multiply(currentOffset);
+
+                    const bDat = this.motionData[f].bones[mpIdx];
+                    if (bDat.baseX === undefined) {
+                        bDat.baseX = bDat.x; bDat.baseY = bDat.y; bDat.baseZ = bDat.z; bDat.baseW = bDat.w;
+                    }
+                    bDat.x = finalQ.x; bDat.y = finalQ.y; bDat.z = finalQ.z; bDat.w = finalQ.w;
+                    bDat.isBlended = true;
+
+                    if (pOffsetA && pOffsetB && this.motionData[f].hipsPos) {
+                        let curPOffset = pOffsetA.clone().lerp(pOffsetB, t);
+                        let finalP = getRawPos(f).clone().add(curPOffset);
+                        const pDat = this.motionData[f].hipsPos;
+                        if (pDat.baseX === undefined) {
+                            pDat.baseX = pDat.x; pDat.baseY = pDat.y; pDat.baseZ = pDat.z;
+                        }
+                        pDat.x = finalP.x; pDat.y = finalP.y; pDat.z = finalP.z;
+                        pDat.isBlended = true;
+                    }
+                    this.motionData[f].hasManualEdits = true;
+                }
+            } else {
+                for (let d = 1; d <= BLEND_FRAMES && d < forwardDist; d++) {
+                    let f = mk + d;
+                    if (!this.motionData[f] || !this.motionData[f].bones[mpIdx]) continue;
+                    let t = d / (BLEND_FRAMES + 1);
+                    let currentOffset = new this.THREE.Quaternion().copy(qOffsetA).slerp(new this.THREE.Quaternion(), t);
+                    let finalQ = getRawQuat(f).clone().multiply(currentOffset);
+
+                    const bDat = this.motionData[f].bones[mpIdx];
+                    if (bDat.baseX === undefined) {
+                        bDat.baseX = bDat.x; bDat.baseY = bDat.y; bDat.baseZ = bDat.z; bDat.baseW = bDat.w;
+                    }
+                    bDat.x = finalQ.x; bDat.y = finalQ.y; bDat.z = finalQ.z; bDat.w = finalQ.w;
+                    bDat.isBlended = true;
+
+                    if (pOffsetA && this.motionData[f].hipsPos) {
+                        let curPOffset = pOffsetA.clone().lerp(new this.THREE.Vector3(0, 0, 0), t);
+                        let finalP = getRawPos(f).clone().add(curPOffset);
+                        const pDat = this.motionData[f].hipsPos;
+                        if (pDat.baseX === undefined) {
+                            pDat.baseX = pDat.x; pDat.baseY = pDat.y; pDat.baseZ = pDat.z;
+                        }
+                        pDat.x = finalP.x; pDat.y = finalP.y; pDat.z = finalP.z;
+                        pDat.isBlended = true;
+                    }
+                    this.motionData[f].hasManualEdits = true;
+                }
+            }
+
+            const prevMK = i > 0 ? manualKeys[i - 1] : null;
+            const backDist = prevMK !== null ? mk - prevMK : 999999;
+            if (prevMK !== null && backDist <= BLEND_FRAMES * 2) {
+                // Handled by forward pass of prevMK
+            } else {
+                for (let d = 1; d <= BLEND_FRAMES && d < backDist; d++) {
+                    let f = mk - d;
+                    if (!this.motionData[f] || !this.motionData[f].bones[mpIdx]) continue;
+                    let t = d / (BLEND_FRAMES + 1);
+                    let currentOffset = new this.THREE.Quaternion().copy(qOffsetA).slerp(new this.THREE.Quaternion(), t);
+                    let finalQ = getRawQuat(f).clone().multiply(currentOffset);
+
+                    const bDat = this.motionData[f].bones[mpIdx];
+                    if (bDat.baseX === undefined) {
+                        bDat.baseX = bDat.x; bDat.baseY = bDat.y; bDat.baseZ = bDat.z; bDat.baseW = bDat.w;
+                    }
+                    bDat.x = finalQ.x; bDat.y = finalQ.y; bDat.z = finalQ.z; bDat.w = finalQ.w;
+                    bDat.isBlended = true;
+
+                    if (pOffsetA && this.motionData[f].hipsPos) {
+                        let curPOffset = pOffsetA.clone().lerp(new this.THREE.Vector3(0, 0, 0), t);
+                        let finalP = getRawPos(f).clone().add(curPOffset);
+                        const pDat = this.motionData[f].hipsPos;
+                        if (pDat.baseX === undefined) {
+                            pDat.baseX = pDat.x; pDat.baseY = pDat.y; pDat.baseZ = pDat.z;
+                        }
+                        pDat.x = finalP.x; pDat.y = finalP.y; pDat.z = finalP.z;
+                        pDat.isBlended = true;
+                    }
+                    this.motionData[f].hasManualEdits = true;
+                }
+            }
+        }
     }
 
 
-        // --- UNIFIED RANGE & DELETION LOGIC ---
     updateRangeHighlight() {
         if (!this.rangeHighlight || !this.videoEl || isNaN(this.videoEl.duration) || this.videoEl.duration === 0) return;
         const totalFrames = Math.round(this.videoEl.duration * 30);
-        
-        // Create Visual Brackets if they don't exist
+
         if (!this.inMarker) {
             this.inMarker = document.createElement("div");
-            Object.assign(this.inMarker.style, { 
-                position: "absolute", top: "-4px", color: "#00ff00", fontWeight: "900", 
-                fontSize: "24px", pointerEvents: "none", zIndex: "3", display: "none", transform: "translateX(-50%)" 
+            Object.assign(this.inMarker.style, {
+                position: "absolute", top: "-4px", color: "#00ff00", fontWeight: "900",
+                fontSize: "24px", pointerEvents: "none", zIndex: "3", display: "none", transform: "translateX(-50%)"
             });
             this.inMarker.innerText = "❲";
             this.ticksContainer.appendChild(this.inMarker);
-            
+
             this.outMarker = document.createElement("div");
-            Object.assign(this.outMarker.style, { 
-                position: "absolute", top: "-4px", color: "#ff0000", fontWeight: "900", 
-                fontSize: "24px", pointerEvents: "none", zIndex: "3", display: "none", transform: "translateX(-50%)" 
+            Object.assign(this.outMarker.style, {
+                position: "absolute", top: "-4px", color: "#ff0000", fontWeight: "900",
+                fontSize: "24px", pointerEvents: "none", zIndex: "3", display: "none", transform: "translateX(-50%)"
             });
             this.outMarker.innerText = "❳";
             this.ticksContainer.appendChild(this.outMarker);
@@ -1693,26 +1824,25 @@ class MocapSurgeonViewport {
             this.rangeHighlight.style.display = "block";
             let start = this.markInFrame != null ? this.markInFrame : 0;
             let end = this.markOutFrame != null ? this.markOutFrame : totalFrames;
-            
+
             if (start > end) { let temp = start; start = end; end = temp; }
-            
+
             let startPct = (start / totalFrames) * 100;
             let endPct = (end / totalFrames) * 100;
-            
+
             this.rangeHighlight.style.left = `${startPct}%`;
             this.rangeHighlight.style.width = `${Math.max(0.5, endPct - startPct)}%`;
-            // UX FIX: Force the box to overlay the slider with thick neon borders
-            this.rangeHighlight.style.zIndex = "5"; 
+            this.rangeHighlight.style.zIndex = "5";
             this.rangeHighlight.style.borderLeft = this.markInFrame != null ? "4px solid #00ff00" : "none";
             this.rangeHighlight.style.borderRight = this.markOutFrame != null ? "4px solid #ff0000" : "none";
             this.rangeHighlight.style.height = "16px";
             this.rangeHighlight.style.top = "2px";
-            
+
             if (this.markInFrame != null) {
                 this.inMarker.style.display = "block";
                 this.inMarker.style.left = `${(this.markInFrame / totalFrames) * 100}%`;
             } else this.inMarker.style.display = "none";
-            
+
             if (this.markOutFrame != null) {
                 this.outMarker.style.display = "block";
                 this.outMarker.style.left = `${(this.markOutFrame / totalFrames) * 100}%`;
@@ -1727,32 +1857,29 @@ class MocapSurgeonViewport {
     deleteData() {
         if (!this.videoEl || this.currentFrameIndex === null) return;
         const totalFrames = Math.round(this.videoEl.duration * 30);
-        
+
         let start = this.markInFrame != null ? this.markInFrame : this.currentFrameIndex;
         let end = this.markOutFrame != null ? this.markOutFrame : this.currentFrameIndex;
         if (start > end) { let temp = start; start = end; end = temp; }
-        
+
         let paddedStart = Math.max(0, start - 10);
         let paddedEnd = Math.min(totalFrames, end + 10);
-        
-        // 1. Wipe everything in the padded range back to pristine AI data
+
         for (let f = paddedStart; f <= paddedEnd; f++) {
             if (this.motionData[f] && this.motionData[f].bones) {
                 let targetBones = Object.keys(this.motionData[f].bones);
                 if (this.selectedMpIdx && this.markInFrame == null && this.markOutFrame == null) {
                     targetBones = [this.selectedMpIdx];
                 }
-                
+
                 targetBones.forEach(mpIdx => {
                     let bDat = this.motionData[f].bones[mpIdx];
                     if (bDat) {
-                        // Only delete the manual anchor if it's strictly inside the selected range
                         if (f >= start && f <= end) bDat.isManual = false;
-                        
-                        bDat.isBlended = false; 
-                        // RESTORE BASE AI TRACKING
+
+                        bDat.isBlended = false;
                         if (bDat.baseX !== undefined) {
-                            bDat.x = bDat.baseX; bDat.y = bDat.baseY; bDat.z = bDat.baseZ; 
+                            bDat.x = bDat.baseX; bDat.y = bDat.baseY; bDat.z = bDat.baseZ;
                             if (bDat.baseW !== undefined) bDat.w = bDat.baseW;
                         }
                     }
@@ -1765,7 +1892,7 @@ class MocapSurgeonViewport {
                         }
                     }
                 });
-                
+
                 let anyManual = false;
                 for (let key in this.motionData[f].bones) {
                     if (this.motionData[f].bones[key].isManual) anyManual = true;
@@ -1773,24 +1900,23 @@ class MocapSurgeonViewport {
                 this.motionData[f].hasManualEdits = anyManual;
             }
         }
-        
-        // 2. NEW: Re-trigger Slerp for any SURVIVING manual keyframes nearby to heal the gap!
+
         for (let f = paddedStart - 10; f <= paddedEnd + 10; f++) {
             if (this.motionData[f] && this.motionData[f].bones) {
                 let targetBones = this.selectedMpIdx && this.markInFrame == null && this.markOutFrame == null ? [this.selectedMpIdx] : Object.keys(this.motionData[f].bones);
                 targetBones.forEach(mpIdx => {
-                    if (this.motionData[f].bones[mpIdx]?.isManual) {
+                    if (this.motionData[f].bones[mpIdx] && this.motionData[f].bones[mpIdx].isManual) {
                         this.performBlendAt(f, mpIdx);
                     }
                 });
             }
         }
-        
+
         this.markInFrame = null;
         this.markOutFrame = null;
         this.updateRangeHighlight();
         this.updateTimelineTicks();
-        this.lastOnionFrame = -1; // Force Onion Skin redraw
+        this.lastOnionFrame = -1;
     }
 
     syncCamera() {
@@ -1800,75 +1926,77 @@ class MocapSurgeonViewport {
         const vh = this.videoEl.videoHeight;
         const videoAspect = vw / vh;
 
-        // Container bounds
         const cw = this.container.clientWidth;
         const ch = this.container.clientHeight;
         const containerAspect = cw / ch;
 
         let renderWidth, renderHeight;
 
-        // Simulate pure 'object-fit: contain' mathematics
-        // We calculate the exact physical pixel box the video occupies on screen
         if (containerAspect > videoAspect) {
-            // Container is wider than the video; video is constrained by height (Pillarboxed)
             renderHeight = ch;
             renderWidth = ch * videoAspect;
         } else {
-            // Container is taller than the video; video is constrained by width (Letterboxed)
             renderWidth = cw;
             renderHeight = cw / videoAspect;
         }
 
-        // Snap the transparent 3D Canvas exactly to the video's calculated dimensions
         this.canvasWrap.style.width = `${renderWidth}px`;
         this.canvasWrap.style.height = `${renderHeight}px`;
 
         this.renderer.setSize(renderWidth, renderHeight, false);
-        
-        // Resize Debug Overlay to match pixel-to-pixel
+
         this.debugCanvas.width = renderWidth;
         this.debugCanvas.height = renderHeight;
-        
-        // Sync Three.js Camera FOV geometry mapping
+
         this.camera.aspect = videoAspect;
         this.camera.updateProjectionMatrix();
 
         if (this.poseLandmarker && this.baseRigShoulderWidth > 0) {
-            // Force a detection right now if we don't have a recent cache
             let targetPose = this.currentPose;
             if (!targetPose && this.videoEl.readyState >= 2) {
                 try {
-                    // MOCAP SURGEON SYNTHETIC CLOCK: Step it forward artificially to prevent a timeline crash
                     this.mpClock += 33.333;
-                    targetPose = this.poseLandmarker.detectForVideo(this.videoEl, this.mpClock);
-                } catch(e) { console.error("Camera Sync MP Error:", e); }
+                    let nextTimestamp = Math.floor(this.mpClock);
+                    if (this.lastMpTimestamp !== undefined && nextTimestamp <= this.lastMpTimestamp) {
+                        nextTimestamp = this.lastMpTimestamp + 1;
+                    }
+                    this.lastMpTimestamp = nextTimestamp;
+
+                    if (!this.processCanvas) {
+                        this.processCanvas = document.createElement("canvas");
+                    }
+                    if (this.processCanvas.width !== this.videoEl.videoWidth || this.processCanvas.height !== this.videoEl.videoHeight) {
+                        this.processCanvas.width = this.videoEl.videoWidth || 640;
+                        this.processCanvas.height = this.videoEl.videoHeight || 480;
+                    }
+                    const pCtx = this.processCanvas.getContext('2d', { willReadFrequently: true });
+                    pCtx.drawImage(this.videoEl, 0, 0, this.processCanvas.width, this.processCanvas.height);
+
+                    targetPose = this.poseLandmarker.detectForVideo(this.processCanvas, nextTimestamp);
+                } catch (e) { console.error("Camera Sync MP Error:", e); }
             }
 
             if (targetPose && targetPose.landmarks && targetPose.landmarks.length > 0) {
-                // FOV STABILIZATION FIX: Use Raw unmirrored data exclusively for distance calculations.
                 const rawPose = targetPose.landmarks[0];
                 const l2D = rawPose[11];
                 const r2D = rawPose[12];
 
                 if (l2D && r2D) {
-                    // Extract exact normalized Euclidean distance accounting for stretched projection ratios
                     const dx_norm = (r2D.x - l2D.x) * videoAspect;
                     const dy_norm = (r2D.y - l2D.y);
                     const mpShoulderDistance = Math.hypot(dx_norm, dy_norm);
-                    
-                    // Exact pixel distance for Console Debugging
+
                     const dx_px = (r2D.x - l2D.x) * renderWidth;
                     const dy_px = (r2D.y - l2D.y) * renderHeight;
                     const shoulderDistancePixels = Math.hypot(dx_px, dy_px);
 
                     const distance = Math.abs(this.camera.position.z);
-                    const currentRigWidth = this.baseRigShoulderWidth * this.rigScale; // Dynamically accounts for user slider scale adjustments
-                    
+                    const currentRigWidth = this.baseRigShoulderWidth * this.rigScale;
+
                     if (mpShoulderDistance > 0.001) {
-                        // Formula mathematically locks the dynamic FOV so the invisible viewport mapping identically overlaps the video width
                         const tanFovOver2 = currentRigWidth / (mpShoulderDistance * 2 * distance);
                         const fovRad = 2 * Math.atan(tanFovOver2);
-                        
+
                         this.camera.fov = this.THREE.MathUtils.radToDeg(fovRad);
                         this.camera.updateProjectionMatrix();
                     }
@@ -1879,12 +2007,10 @@ class MocapSurgeonViewport {
 
     onResize() {
         if (!this.renderer || !this.camera) return;
-        
+
         if (this.videoEl && this.videoEl.videoWidth) {
-            // If we have a video, maintain the rigid sync alignment during resize
             this.syncCamera();
         } else {
-            // No video yet, just fill the container
             const w = this.container.clientWidth;
             const h = this.container.clientHeight;
             this.canvasWrap.style.width = `100%`;
@@ -1899,13 +2025,9 @@ class MocapSurgeonViewport {
         }
     }
 
-    // --- NEW: RAW LANDMARK PRE-SMOOTHING ---
-    // Heavily filters the raw point clouds before any cross-products or math to stop 
-    // normals (like torsoForward or palmUp) from flipping wildly.
     filterLandmarks(landmarks, filtersArray, timestamp, customCutoff = this.filterMinCutoff, customBeta = this.filterBeta) {
         if (!landmarks) return null;
-        
-        // HARD BYPASS: If customCutoff is -1, skip all math and return raw data instantly
+
         if (customCutoff === -1) {
             return landmarks.map(lm => ({
                 x: lm.x, y: lm.y, z: lm.z,
@@ -1917,15 +2039,13 @@ class MocapSurgeonViewport {
         for (let i = 0; i < landmarks.length; i++) {
             let lm = landmarks[i];
             if (!lm) continue;
-            
-            // Initialize filter if not exists
+
             if (!filtersArray[i]) {
                 filtersArray[i] = new OneEuroFilter3D(30);
             }
-            
-            // Filter x, y, z individually using allowed custom bypass values
-            let f = filtersArray[i].filter({x: lm.x, y: lm.y, z: lm.z}, timestamp, customCutoff, customBeta);
-            
+
+            let f = filtersArray[i].filter({ x: lm.x, y: lm.y, z: lm.z }, timestamp, customCutoff, customBeta);
+
             smoothed[i] = {
                 x: f.x,
                 y: f.y,
@@ -1936,7 +2056,6 @@ class MocapSurgeonViewport {
         return smoothed;
     }
 
-    // UNIVERSAL MAP: Passes variables straight down without inversion or swapping, solving the Left/Right crossing natively.
     getMappedPose(pose) {
         if (!pose) return null;
         const mapped = [];
@@ -1948,13 +2067,12 @@ class MocapSurgeonViewport {
         return mapped;
     }
 
-    // 1. Position: Only the Hips use 2D Raycasting to lock onto the Z=0 video plane
     getRaycast3D(pose, index1, index2 = null) {
         if (!pose || !pose[index1]) return null;
         let x = pose[index1].x;
         let y = pose[index1].y;
         let vis = pose[index1].visibility;
-        
+
         if (index2 !== null && pose[index2]) {
             x = (x + pose[index2].x) / 2;
             y = (y + pose[index2].y) / 2;
@@ -1964,65 +2082,59 @@ class MocapSurgeonViewport {
         if (vis < this.confidenceThreshold) return null;
         if (isNaN(x) || isNaN(y)) return null;
 
-        // Native mapping
         const ndcX = (x * 2) - 1;
         const ndcY = -(y * 2) + 1;
-        
+
         this.raycaster.setFromCamera(new this.THREE.Vector2(ndcX, ndcY), this.camera);
-        
+
         const target3D = new this.THREE.Vector3();
         if (this.raycaster.ray.intersectPlane(this.zPlane, target3D)) {
             if (!isNaN(target3D.x) && !isNaN(target3D.y) && !isNaN(target3D.z)) {
-                target3D.z = 0; // Prevent Rig depth-drift
+                target3D.z = 0;
                 return target3D;
             }
         }
         return null;
     }
 
-    // 2. Vector Extraction: Returns a purely mathematical direction vector derived from World Landmarks
     getDirectionVector(p1, p2, forwardHintMag = 0, flattenZ = false, torsoForward = null) {
         if (!p1 || !p2) return null;
         if (p1.visibility !== undefined && (p1.visibility < this.confidenceThreshold || p2.visibility < this.confidenceThreshold)) return null;
 
-        const dx = (p2.x - p1.x); 
-        const dy = -(p2.y - p1.y); // MP positive Y is down, Three positive Y is up
-        let dz = -(p2.z - p1.z); // MP positive Z is away, Three positive Z is toward camera
+        const dx = (p2.x - p1.x);
+        const dy = -(p2.y - p1.y);
+        let dz = -(p2.z - p1.z);
 
-        if (flattenZ) dz = 0; // Force limb (like a foot) to stay flat against the screen plane
+        if (flattenZ) dz = 0;
 
         const dir = new this.THREE.Vector3(dx, dy, dz).normalize();
-        
-        // SINGULARITY FIX: Guard against collapsed vectors before math
+
         if (isNaN(dir.x) || isNaN(dir.y) || isNaN(dir.z)) return null;
-        
-        // Pole Vector Hint (subtly bends joint forward to prevent reverse IK snapping)
+
         if (forwardHintMag !== 0) {
             if (torsoForward) {
                 dir.addScaledVector(torsoForward, forwardHintMag);
             } else {
-                dir.z += forwardHintMag; // Fallback to global +Z (camera)
+                dir.z += forwardHintMag;
             }
-            
+
             dir.normalize();
-            if (isNaN(dir.x) || isNaN(dir.y) || isNaN(dir.z)) return null; 
+            if (isNaN(dir.x) || isNaN(dir.y) || isNaN(dir.z)) return null;
         }
         return dir;
     }
 
-    // 3A. Standard Execution: Calculates Target Offset and applies the ONE EURO FILTER
-    // BICEP ROLL FIX: Added rollOffset parameter to apply a twist along the local Y axis AFTER lookAt pitching
     boneLookAtDir(mpIdx, bone, dirVector, timestamp, customUp = null, pitchOffset = Math.PI / 2, rollOffset = 0) {
         if (!bone) return;
-        
+
         if (!this.boneFilters[mpIdx]) {
             this.boneFilters[mpIdx] = new OneEuroFilterQuat(30);
         }
-        
+
         if (!bone.userData.restQuaternion) {
             bone.userData.restQuaternion = bone.quaternion.clone();
         }
-        
+
         if (!dirVector) {
             bone.quaternion.slerp(bone.userData.restQuaternion, 0.05);
             bone.updateMatrixWorld(true);
@@ -2032,60 +2144,51 @@ class MocapSurgeonViewport {
         const targetPos = new this.THREE.Vector3();
         bone.getWorldPosition(targetPos);
         targetPos.add(dirVector);
-        
+
         if (customUp) {
             bone.up.copy(customUp);
         } else {
-            bone.up.set(0, 1, 0); 
+            bone.up.set(0, 1, 0);
         }
-        
+
         bone.lookAt(targetPos);
-        if (pitchOffset !== 0) bone.rotateX(pitchOffset); 
-        if (rollOffset !== 0) bone.rotateY(rollOffset); 
-        
+        if (pitchOffset !== 0) bone.rotateX(pitchOffset);
+        if (rollOffset !== 0) bone.rotateY(rollOffset);
+
         const targetQuat = bone.quaternion.clone();
-        
-        if (isNaN(targetQuat.x) || isNaN(targetQuat.y) || isNaN(targetQuat.z) || isNaN(targetQuat.w)) return; 
-        
-        // 1€ Filter Application (Replaces Slerp)
+
+        if (isNaN(targetQuat.x) || isNaN(targetQuat.y) || isNaN(targetQuat.z) || isNaN(targetQuat.w)) return;
+
         let fq = this.boneFilters[mpIdx].filter(targetQuat, timestamp, this.filterMinCutoff, this.filterBeta);
-        
-        // Emergency State Reset for Filter
+
         if (isNaN(fq.x)) {
             this.boneFilters[mpIdx] = new OneEuroFilterQuat(30);
             return;
         }
-        
-        // SLERP POPPING FIX: Check if this exact frame has a locked manual edit or slerp blend
-        const existingData = this.currentFrameIndex !== null ? this.motionData[this.currentFrameIndex]?.bones?.[mpIdx] : null;
+
+        const existingData = this.currentFrameIndex !== null && this.motionData[this.currentFrameIndex] && this.motionData[this.currentFrameIndex].bones ? this.motionData[this.currentFrameIndex].bones[mpIdx] : null;
         const isProtected = existingData && (existingData.isManual || existingData.isBlended);
 
         if (isProtected) {
-            // Apply protected Slerp/Manual keyframe to the rig instead of live tracking!
             bone.quaternion.set(existingData.x, existingData.y, existingData.z, existingData.w).normalize();
-            // We do NOT overwrite this.motionData because it would destroy the user's edits.
         } else {
-            // Apply live filtered tracking
             bone.quaternion.set(fq.x, fq.y, fq.z, fq.w).normalize();
-            
-            // Save to tracking memory
+
             if (this.currentFrameIndex !== null && this.motionData[this.currentFrameIndex]) {
-                this.motionData[this.currentFrameIndex].bones[mpIdx] = { 
+                this.motionData[this.currentFrameIndex].bones[mpIdx] = {
                     x: bone.quaternion.x, y: bone.quaternion.y, z: bone.quaternion.z, w: bone.quaternion.w,
-                    rawX: targetQuat.x, rawY: targetQuat.y, rawZ: targetQuat.z, rawW: targetQuat.w, // EXPORT JITTER FIX: Must save the pure RAW vector, not the filtered one!
-                    isManual: false 
+                    rawX: targetQuat.x, rawY: targetQuat.y, rawZ: targetQuat.z, rawW: targetQuat.w,
+                    isManual: false
                 };
             }
         }
-        
+
         bone.updateMatrixWorld(true);
     }
 
-    // 3B. "Swing" Execution: Exclusively for fingers and appendages with baked-in native rolls. 
-    // Mathematically calculates the shortest-path rotation to the target while strictly preserving the bone's rest-pose roll.
     boneSwingAtDir(mpIdx, bone, dirVector, timestamp, customCutoff = this.filterMinCutoff, customBeta = this.filterBeta) {
         if (!bone || !dirVector) return;
-        
+
         if (!this.boneFilters[mpIdx]) {
             this.boneFilters[mpIdx] = new OneEuroFilterQuat(30);
         }
@@ -2093,62 +2196,53 @@ class MocapSurgeonViewport {
             bone.userData.restQuaternion = bone.quaternion.clone();
         }
 
-        // 1. Reset to local rest to inherit parent's exact current dynamic rotation
         bone.quaternion.copy(bone.userData.restQuaternion);
         bone.updateMatrixWorld(true);
 
-        // 2. Extract current global forward vector (Mixamo arms/fingers point down local +Y)
         let currentGlobalQ = new this.THREE.Quaternion();
         bone.getWorldQuaternion(currentGlobalQ);
         let fwd = new this.THREE.Vector3(0, 1, 0).applyQuaternion(currentGlobalQ).normalize();
-        
+
         let targetDir = dirVector.clone().normalize();
 
-        // 3. Compute Swing (shortest rotation from Rest Forward to Target Direction)
         let swing = new this.THREE.Quaternion().setFromUnitVectors(fwd, targetDir);
 
-        // 4. Apply swing to global quaternion
         let targetGlobalQ = swing.multiply(currentGlobalQ);
 
-        // 5. Convert target global quaternion safely back to local space
         let parentGlobalQ = new this.THREE.Quaternion();
         if (bone.parent) {
             bone.parent.getWorldQuaternion(parentGlobalQ);
         }
         let targetLocalQ = parentGlobalQ.invert().multiply(targetGlobalQ);
 
-        // 6. Filter and apply (with Hard Bypass for zero delay)
         let fq;
         if (customCutoff === -1) {
-            fq = { x: targetLocalQ.x, y: targetLocalQ.y, z: targetLocalQ.z, w: targetLocalQ.w }; 
+            fq = { x: targetLocalQ.x, y: targetLocalQ.y, z: targetLocalQ.z, w: targetLocalQ.w };
         } else {
             fq = this.boneFilters[mpIdx].filter(targetLocalQ, timestamp, customCutoff, customBeta);
         }
-        
+
         if (!isNaN(fq.x)) {
-            // SLERP POPPING FIX
-            const existingData = this.currentFrameIndex !== null ? this.motionData[this.currentFrameIndex]?.bones?.[mpIdx] : null;
+            const existingData = this.currentFrameIndex !== null && this.motionData[this.currentFrameIndex] && this.motionData[this.currentFrameIndex].bones ? this.motionData[this.currentFrameIndex].bones[mpIdx] : null;
             const isProtected = existingData && (existingData.isManual || existingData.isBlended);
 
             if (isProtected) {
                 bone.quaternion.set(existingData.x, existingData.y, existingData.z, existingData.w).normalize();
             } else {
                 bone.quaternion.set(fq.x, fq.y, fq.z, fq.w).normalize();
-                
+
                 if (this.currentFrameIndex !== null && this.motionData[this.currentFrameIndex]) {
-                    this.motionData[this.currentFrameIndex].bones[mpIdx] = { 
+                    this.motionData[this.currentFrameIndex].bones[mpIdx] = {
                         x: bone.quaternion.x, y: bone.quaternion.y, z: bone.quaternion.z, w: bone.quaternion.w,
-                        rawX: targetLocalQ.x, rawY: targetLocalQ.y, rawZ: targetLocalQ.z, rawW: targetLocalQ.w, // Raw unfiltered vector
-                        isManual: false 
+                        rawX: targetLocalQ.x, rawY: targetLocalQ.y, rawZ: targetLocalQ.z, rawW: targetLocalQ.w,
+                        isManual: false
                     };
                 }
             }
         }
         bone.updateMatrixWorld(true);
     }
-    
-    // NEW: Matrix Un-Rotation applied to MediaPipe capture. Extracts pure localized expressions.
-    // Uses Isotropic Pixel Space to completely eliminate mesh-mangling bugs on non-16:9 video aspect ratios.
+
     extractFaceData(face, w, h) {
         const toVec3 = (mpPoint) => new this.THREE.Vector3(mpPoint.x * w, mpPoint.y * h, mpPoint.z * w);
         const pLeft = toVec3(face[234]);
@@ -2172,47 +2266,178 @@ class MocapSurgeonViewport {
         });
     }
 
-    // NEW: Additive Logic Execution for the Face. Captures MP local offset, Filters it, and translates the 3D Rest bone.
     bonePositionDelta(mpIdx, bone, dx, dy, dz, timestamp, customCutoff = this.filterMinCutoff, customBeta = this.filterBeta) {
         if (!bone) return;
-        
+
         if (!this.boneFilters[mpIdx]) {
             this.boneFilters[mpIdx] = new OneEuroFilter3D(30);
         }
-        
-        // Apply MP offset entirely locally to its original rest setup
+
         let targetPos = bone.userData.restPosition.clone().add(new this.THREE.Vector3(dx, dy, dz));
-        
-        // Hard Bypass for zero delay
+
         let fPos;
         if (customCutoff === -1) {
-            fPos = { x: targetPos.x, y: targetPos.y, z: targetPos.z }; 
+            fPos = { x: targetPos.x, y: targetPos.y, z: targetPos.z };
         } else {
             fPos = this.boneFilters[mpIdx].filter(targetPos, timestamp, customCutoff, customBeta);
         }
-        
+
         if (!isNaN(fPos.x)) {
-            // SLERP POPPING FIX
-            const existingData = this.currentFrameIndex !== null ? this.motionData[this.currentFrameIndex]?.bones?.[mpIdx] : null;
+            const existingData = this.currentFrameIndex !== null && this.motionData[this.currentFrameIndex] && this.motionData[this.currentFrameIndex].bones ? this.motionData[this.currentFrameIndex].bones[mpIdx] : null;
             const isProtected = existingData && (existingData.isManual || existingData.isBlended);
 
             if (isProtected) {
                 bone.position.set(existingData.posX, existingData.posY, existingData.posZ);
             } else {
                 bone.position.set(fPos.x, fPos.y, fPos.z);
-                
+
                 if (this.currentFrameIndex !== null && this.motionData[this.currentFrameIndex]) {
                     if (!this.motionData[this.currentFrameIndex].bones) this.motionData[this.currentFrameIndex].bones = {};
                     this.motionData[this.currentFrameIndex].bones[mpIdx] = {
                         posX: fPos.x, posY: fPos.y, posZ: fPos.z,
-                        rawX: targetPos.x, rawY: targetPos.y, rawZ: targetPos.z, // Raw target pos
+                        rawX: targetPos.x, rawY: targetPos.y, rawZ: targetPos.z,
                         isManual: false
                     };
                 }
             }
         }
-        
+
         bone.updateMatrixWorld(true);
+    }
+
+    // --- TIMESTAMP MANAGEMENT ---
+    _resetMpTimestamps() {
+        // Reset the synthetic monotonic clock so MediaPipe doesn't get stale/backwards timestamps
+        this.mpClock = 0;
+        this.lastMpTimestamp = undefined;
+        this.lastVideoTimeMs = -1;
+        this._lastProcessedVideoTimeMs = -1;
+        this._mpNeedsRestart = false;
+        this._trackingInFlight = false;
+        this._pendingPose = null;
+        this._pendingHands = null;
+        this._pendingFace = null;
+    }
+
+    // --- ASYNC MEDIAPIPE INFERENCE (decoupled from render loop) ---
+    async processTrackingFrame(videoEl, currentTimeMs) {
+        // Guard: don't overlap inference calls
+        if (this._trackingInFlight) return;
+        if (!this.poseLandmarker || !videoEl || videoEl.readyState < 2) return;
+
+        // Guard: don't re-process the same video frame
+        if (currentTimeMs === this._lastProcessedVideoTimeMs) return;
+
+        this._trackingInFlight = true;
+        this._lastProcessedVideoTimeMs = currentTimeMs;
+
+        try {
+            // Recovery: if MP crashed previously, reset the clock
+            if (this._mpNeedsRestart) {
+                this._resetMpTimestamps();
+            }
+
+            // Build a monotonically increasing timestamp for MediaPipe
+            let delta = 33.333;
+            if (this.lastVideoTimeMs >= 0) {
+                delta = currentTimeMs - this.lastVideoTimeMs;
+                if (delta <= 0) delta = 33.333;
+            }
+            this.mpClock += delta;
+            this.lastVideoTimeMs = currentTimeMs;
+
+            let nextTimestamp = Math.floor(this.mpClock);
+            if (this.lastMpTimestamp !== undefined && nextTimestamp <= this.lastMpTimestamp) {
+                nextTimestamp = this.lastMpTimestamp + 1;
+            }
+            this.lastMpTimestamp = nextTimestamp;
+            const mpTimestamp = nextTimestamp;
+
+            // Prepare the processing canvas
+            if (!this.processCanvas) {
+                this.processCanvas = document.createElement("canvas");
+            }
+            if (this.processCanvas.width !== videoEl.videoWidth || this.processCanvas.height !== videoEl.videoHeight) {
+                this.processCanvas.width = videoEl.videoWidth || 640;
+                this.processCanvas.height = videoEl.videoHeight || 480;
+            }
+            const pCtx = this.processCanvas.getContext('2d', { willReadFrequently: true });
+            pCtx.drawImage(videoEl, 0, 0, this.processCanvas.width, this.processCanvas.height);
+
+            // Run MediaPipe inference (this is the expensive part)
+            let poseResult = null, handResult = null, faceResult = null;
+
+            try {
+                poseResult = this.poseLandmarker.detectForVideo(this.processCanvas, mpTimestamp);
+            } catch (e) {
+                console.error("[Mocap Surgeon] MediaPipe Pose Inference crashed:", e);
+                this._mpNeedsRestart = true;
+            }
+
+            if (!this._mpNeedsRestart && this.trackHands && this.handLandmarker) {
+                try { handResult = this.handLandmarker.detectForVideo(this.processCanvas, mpTimestamp); } catch (e) {
+                    console.warn("[Mocap Surgeon] Hand inference error:", e);
+                }
+            }
+
+            if (!this._mpNeedsRestart && this.trackFace && this.faceLandmarker) {
+                try { faceResult = this.faceLandmarker.detectForVideo(this.processCanvas, mpTimestamp); } catch (e) {
+                    console.warn("[Mocap Surgeon] Face inference error:", e);
+                }
+            }
+
+            // Stage results for the next render frame to pick up
+            this._pendingPose = poseResult;
+            this._pendingHands = handResult;
+            this._pendingFace = faceResult;
+            this._pendingTimestamp = videoEl.currentTime;
+
+        } catch (e) {
+            console.error("[Mocap Surgeon] processTrackingFrame error:", e);
+            this._mpNeedsRestart = true;
+        } finally {
+            this._trackingInFlight = false;
+        }
+    }
+
+    _interpolateFrames(frameA, frameB, t) {
+        let result = { hipsPos: null, bones: {}, hasManualEdits: false };
+
+        if (frameA.hipsPos && frameB.hipsPos) {
+            result.hipsPos = {
+                x: this.THREE.MathUtils.lerp(frameA.hipsPos.x, frameB.hipsPos.x, t),
+                y: this.THREE.MathUtils.lerp(frameA.hipsPos.y, frameB.hipsPos.y, t),
+                z: this.THREE.MathUtils.lerp(frameA.hipsPos.z, frameB.hipsPos.z, t)
+            };
+        }
+
+        for (let mpIdx in frameA.bones) {
+            if (frameB.bones[mpIdx]) {
+                let bA = frameA.bones[mpIdx];
+                let bB = frameB.bones[mpIdx];
+
+                if (parseInt(mpIdx) >= 300 && parseInt(mpIdx) <= 369) {
+                    // Face positional deltas
+                    if (bA.posX !== undefined && bB.posX !== undefined) {
+                        result.bones[mpIdx] = {
+                            posX: this.THREE.MathUtils.lerp(bA.posX, bB.posX, t),
+                            posY: this.THREE.MathUtils.lerp(bA.posY, bB.posY, t),
+                            posZ: this.THREE.MathUtils.lerp(bA.posZ, bB.posZ, t)
+                        };
+                    }
+                } else {
+                    // Rotations
+                    if (bA.x !== undefined && bB.x !== undefined) {
+                        let qA = new this.THREE.Quaternion(bA.x, bA.y, bA.z, bA.w);
+                        let qB = new this.THREE.Quaternion(bB.x, bB.y, bB.z, bB.w);
+                        let qRes = new this.THREE.Quaternion().slerpQuaternions(qA, qB, t);
+
+                        result.bones[mpIdx] = { x: qRes.x, y: qRes.y, z: qRes.z, w: qRes.w };
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     animate() {
@@ -2221,8 +2446,9 @@ class MocapSurgeonViewport {
 
         let currentTimeSec = this.videoEl ? this.videoEl.currentTime : 0;
         this.currentFrameIndex = Math.round(currentTimeSec * 30);
-        
+
         const isActivelyPlaying = this.videoEl && !this.videoEl.paused;
+        const isRecordingPass = isActivelyPlaying && this.isRecordingMode && !this.isScrubbing;
 
         if (this.mixer && this.videoEl) {
             this.mixer.setTime(currentTimeSec);
@@ -2237,8 +2463,7 @@ class MocapSurgeonViewport {
         if (this.timelineSlider && !this.isScrubbing) {
             this.timelineSlider.value = currentTimeSec;
         }
-        
-        // --- NEW FRAMES UI DISPLAY (WITH RANGE TEXT) ---
+
         if (this.timeLabel) {
             const totalFrames = (this.videoEl && !isNaN(this.videoEl.duration)) ? Math.round(this.videoEl.duration * 30) : 0;
             let rangeText = "";
@@ -2249,19 +2474,19 @@ class MocapSurgeonViewport {
             }
             this.timeLabel.innerHTML = `${rangeText}${this.currentFrameIndex} / ${totalFrames} f`;
         }
-        
+
         if (this.recordingIndicator) {
-            this.recordingIndicator.style.display = (isActivelyPlaying && !this.isScrubbing) ? "block" : "none";
+            this.recordingIndicator.style.display = (isRecordingPass) ? "block" : "none";
         }
-        
+
         let isEditedFrame = false;
         if (this.currentFrameIndex !== null && this.motionData[this.currentFrameIndex]) {
             isEditedFrame = this.motionData[this.currentFrameIndex].hasManualEdits;
         }
         if (this.editedIndicator) {
-            this.editedIndicator.style.display = (!isActivelyPlaying && isEditedFrame) ? "block" : "none";
+            this.editedIndicator.style.display = (!isRecordingPass && isEditedFrame) ? "block" : "none";
         }
-        
+
         if (isActivelyPlaying && this.transformControls && this.transformControls.object) {
             this.transformControls.detach();
             this.selectedMpIdx = null;
@@ -2269,63 +2494,65 @@ class MocapSurgeonViewport {
 
         const confThresh = this.confidenceThreshold;
 
-        // --- MASTER SYSTEM TOGGLE: RECORD VS SCRUB ---
-        if (isActivelyPlaying && !this.isScrubbing) {
-            
-            // Ensures the frame structure exists, but DOES NOT wipe out existing edits!
+        // --- MASTER SYSTEM TOGGLE: RECORD VS SCRUB/REVIEW ---
+        if (isRecordingPass) {
+
             if (!this.motionData[this.currentFrameIndex]) {
                 this.motionData[this.currentFrameIndex] = { hipsPos: null, bones: {}, hasManualEdits: false };
             }
-            
+
             // --- RAYCAST MOCAP ENGINE (RECORDING) ---
             if (this.poseLandmarker && this.videoEl && this.videoEl.readyState >= 2) {
                 let currentTimeMs = currentTimeSec * 1000;
                 let isNewVideoFrame = (currentTimeMs !== this.lastVideoTimeMs);
 
+                // SYNCHRONOUS LOCK: Only process exactly when the video frame updates
                 if (isNewVideoFrame) {
-                    // MOCAP SURGEON CLOCK: Calculate a safe, strictly positive time increment
-                    let delta = 33.333; // Default 30fps step
-                    if (this.lastVideoTimeMs >= 0) {
-                        delta = currentTimeMs - this.lastVideoTimeMs;
-                        if (delta <= 0) delta = 33.333; // If video loops or rewinds, force time strictly forward
-                    }
-                    this.mpClock += delta;
                     this.lastVideoTimeMs = currentTimeMs;
-                    
-                    const mpTimestamp = this.mpClock; // Strictly Monotonic Clock fed to AI Core
+
+                    // 1. BULLETPROOF TIMESTAMP: Prevent MediaPipe crashing on loops
+                    let mpTimestamp = performance.now();
+                    if (this.lastMpTimestamp !== undefined && mpTimestamp <= this.lastMpTimestamp) {
+                        mpTimestamp = this.lastMpTimestamp + 0.1;
+                    }
+                    this.lastMpTimestamp = mpTimestamp;
 
                     try {
+                        // FORCE SYNCHRONOUS INFERENCE: Blocks render until AI finishes
                         this.currentPose = this.poseLandmarker.detectForVideo(this.videoEl, mpTimestamp);
-                    } catch (e) { console.error("[Mocap Surgeon] MediaPipe AI Inference crashed:", e); }
-                    
+                    } catch (e) {
+                        console.error("[Mocap Surgeon] MediaPipe Crash:", e);
+                        this.isRecordingMode = false;
+                        this.updatePlayState(false);
+                        this.videoEl.pause();
+                        return;
+                    }
+
                     if (this.trackHands && this.handLandmarker) {
-                        try { this.currentHands = this.handLandmarker.detectForVideo(this.videoEl, mpTimestamp); } catch(e) {}
+                        try { this.currentHands = this.handLandmarker.detectForVideo(this.videoEl, mpTimestamp); } catch (e) { }
                     } else { this.currentHands = null; }
 
                     if (this.trackFace && this.faceLandmarker) {
-                        try { this.currentFace = this.faceLandmarker.detectForVideo(this.videoEl, mpTimestamp); } catch(e) {}
+                        try { this.currentFace = this.faceLandmarker.detectForVideo(this.videoEl, mpTimestamp); } catch (e) { }
                     } else { this.currentFace = null; }
-
-                    // --- PRE-MATH FILTERING PIPELINE START ---
 
                     if (this.currentPose && this.currentPose.landmarks && this.currentPose.landmarks.length > 0) {
                         const rawPose = this.currentPose.landmarks[0];
                         const rawWorldPose = this.currentPose.worldLandmarks && this.currentPose.worldLandmarks[0];
 
-                        // PRE-SMOOTH RAW POINT CLOUDS
+                        // PERFECT dt SYNC: Send the exact Video Time to the 1-Euro Filters
                         this.smoothedPose2D = this.filterLandmarks(rawPose, this.pose2DFilters, currentTimeSec);
                         const smoothedWorldPose = this.filterLandmarks(rawWorldPose, this.poseWorldFilters, currentTimeSec);
 
                         const pose = this.getMappedPose(this.smoothedPose2D);
                         const worldPose = this.getMappedPose(smoothedWorldPose);
 
-                        // HIPS POSITION SOLVER
                         const hips3D = this.upperBodyOnly ? null : this.getRaycast3D(pose, 23, 24);
                         const hipsBone = this.mocapBones[99];
                         if (hipsBone) {
                             if (!hipsBone.userData.restPosition) hipsBone.userData.restPosition = hipsBone.position.clone();
-                            
-                            const existingHips = this.motionData[this.currentFrameIndex]?.hipsPos;
+
+                            const existingHips = this.motionData[this.currentFrameIndex] ? this.motionData[this.currentFrameIndex].hipsPos : null;
                             const isHipsProtected = existingHips && (existingHips.isManual || existingHips.isBlended);
 
                             if (this.upperBodyOnly) {
@@ -2333,10 +2560,10 @@ class MocapSurgeonViewport {
                                     hipsBone.position.set(existingHips.x, existingHips.y, existingHips.z);
                                 } else {
                                     hipsBone.position.copy(hipsBone.userData.restPosition);
-                                    this.motionData[this.currentFrameIndex].hipsPos = { 
+                                    this.motionData[this.currentFrameIndex].hipsPos = {
                                         x: hipsBone.position.x, y: hipsBone.position.y, z: hipsBone.position.z,
                                         rawX: hipsBone.position.x, rawY: hipsBone.position.y, rawZ: hipsBone.position.z,
-                                        isManual: false 
+                                        isManual: false
                                     };
                                 }
                             } else if (hips3D) {
@@ -2346,16 +2573,16 @@ class MocapSurgeonViewport {
                                 }
                                 if (!this.hipsPosFilter) this.hipsPosFilter = new OneEuroFilter3D(30);
                                 let fPos = this.hipsPosFilter.filter(hips3D, currentTimeSec, this.filterMinCutoff, this.filterBeta);
-                                
+
                                 if (!isNaN(fPos.x)) {
                                     if (isHipsProtected) {
                                         hipsBone.position.set(existingHips.x, existingHips.y, existingHips.z);
                                     } else {
                                         hipsBone.position.set(fPos.x, fPos.y, fPos.z);
-                                        this.motionData[this.currentFrameIndex].hipsPos = { 
+                                        this.motionData[this.currentFrameIndex].hipsPos = {
                                             x: fPos.x, y: fPos.y, z: fPos.z,
-                                            rawX: hips3D.x, rawY: hips3D.y, rawZ: hips3D.z, // Save raw
-                                            isManual: false 
+                                            rawX: hips3D.x, rawY: hips3D.y, rawZ: hips3D.z,
+                                            isManual: false
                                         };
                                     }
                                 }
@@ -2366,31 +2593,29 @@ class MocapSurgeonViewport {
                                     hipsBone.position.lerp(hipsBone.userData.restPosition, 0.05);
                                 }
                             }
-                            
-                            // HIPS ROTATION SOLVER
+
                             if (this.upperBodyOnly) {
-                                // Apply the same yaw logic using shoulders to maintain orientation organically
                                 let yaw = 0;
                                 if (worldPose && worldPose[11] && worldPose[12]) {
                                     const dx = worldPose[12].x - worldPose[11].x;
-                                    const dz = -(worldPose[12].z - worldPose[11].z); 
+                                    const dz = -(worldPose[12].z - worldPose[11].z);
                                     yaw = -Math.atan2(dz, dx);
                                 }
                                 const yawQuat = new this.THREE.Quaternion().setFromAxisAngle(new this.THREE.Vector3(0, 1, 0), yaw);
                                 const targetQuat = hipsBone.userData.restQuaternion.clone().premultiply(yawQuat);
-                                
+
                                 if (!this.boneFilters[99]) this.boneFilters[99] = new OneEuroFilterQuat(30);
                                 let fq = this.boneFilters[99].filter(targetQuat, currentTimeSec, this.filterMinCutoff, this.filterBeta);
-                                
+
                                 if (!isNaN(fq.x)) {
-                                    const existingB99 = this.motionData[this.currentFrameIndex]?.bones?.[99];
+                                    const existingB99 = this.motionData[this.currentFrameIndex] && this.motionData[this.currentFrameIndex].bones ? this.motionData[this.currentFrameIndex].bones[99] : null;
                                     const isB99Protected = existingB99 && (existingB99.isManual || existingB99.isBlended);
 
                                     if (isB99Protected) {
                                         hipsBone.quaternion.set(existingB99.x, existingB99.y, existingB99.z, existingB99.w).normalize();
                                     } else {
                                         hipsBone.quaternion.set(fq.x, fq.y, fq.z, fq.w).normalize();
-                                        this.motionData[this.currentFrameIndex].bones[99] = { 
+                                        this.motionData[this.currentFrameIndex].bones[99] = {
                                             x: fq.x, y: fq.y, z: fq.z, w: fq.w,
                                             rawX: targetQuat.x, rawY: targetQuat.y, rawZ: targetQuat.z, rawW: targetQuat.w,
                                             isManual: false
@@ -2398,25 +2623,24 @@ class MocapSurgeonViewport {
                                     }
                                 }
                             } else if (worldPose && worldPose[23] && worldPose[24]) {
-                                // Full body tracking using hips
                                 const dx = worldPose[24].x - worldPose[23].x;
-                                const dz = -(worldPose[24].z - worldPose[23].z); 
-                                const yaw = -Math.atan2(dz, dx); 
+                                const dz = -(worldPose[24].z - worldPose[23].z);
+                                const yaw = -Math.atan2(dz, dx);
                                 const yawQuat = new this.THREE.Quaternion().setFromAxisAngle(new this.THREE.Vector3(0, 1, 0), yaw);
                                 const targetQuat = hipsBone.userData.restQuaternion.clone().premultiply(yawQuat);
-                                
+
                                 if (!this.boneFilters[99]) this.boneFilters[99] = new OneEuroFilterQuat(30);
                                 let fq = this.boneFilters[99].filter(targetQuat, currentTimeSec, this.filterMinCutoff, this.filterBeta);
-                                
+
                                 if (!isNaN(fq.x)) {
-                                    const existingB99 = this.motionData[this.currentFrameIndex]?.bones?.[99];
+                                    const existingB99 = this.motionData[this.currentFrameIndex] && this.motionData[this.currentFrameIndex].bones ? this.motionData[this.currentFrameIndex].bones[99] : null;
                                     const isB99Protected = existingB99 && (existingB99.isManual || existingB99.isBlended);
 
                                     if (isB99Protected) {
                                         hipsBone.quaternion.set(existingB99.x, existingB99.y, existingB99.z, existingB99.w).normalize();
                                     } else {
                                         hipsBone.quaternion.set(fq.x, fq.y, fq.z, fq.w).normalize();
-                                        this.motionData[this.currentFrameIndex].bones[99] = { 
+                                        this.motionData[this.currentFrameIndex].bones[99] = {
                                             x: fq.x, y: fq.y, z: fq.z, w: fq.w,
                                             rawX: targetQuat.x, rawY: targetQuat.y, rawZ: targetQuat.z, rawW: targetQuat.w,
                                             isManual: false
@@ -2424,7 +2648,7 @@ class MocapSurgeonViewport {
                                     }
                                 }
                             } else {
-                                const existingB99 = this.motionData[this.currentFrameIndex]?.bones?.[99];
+                                const existingB99 = this.motionData[this.currentFrameIndex] && this.motionData[this.currentFrameIndex].bones ? this.motionData[this.currentFrameIndex].bones[99] : null;
                                 const isB99Protected = existingB99 && (existingB99.isManual || existingB99.isBlended);
 
                                 if (isB99Protected) {
@@ -2441,77 +2665,71 @@ class MocapSurgeonViewport {
                                 const FORWARD = new this.THREE.Vector3(0, 0, 1).transformDirection(this.rig.matrixWorld);
                                 let spineDir = null;
                                 let torsoForward = FORWARD;
-                                
+
                                 if (worldPose[11] && worldPose[12]) {
                                     const shoulderMid = {
-                                        x: (worldPose[11].x + worldPose[12].x)/2,
-                                        y: (worldPose[11].y + worldPose[12].y)/2,
-                                        z: (worldPose[11].z + worldPose[12].z)/2,
+                                        x: (worldPose[11].x + worldPose[12].x) / 2,
+                                        y: (worldPose[11].y + worldPose[12].y) / 2,
+                                        z: (worldPose[11].z + worldPose[12].z) / 2,
                                         visibility: Math.min(worldPose[11].visibility, worldPose[12].visibility)
                                     };
-                                    
+
                                     if (this.upperBodyOnly) {
-                                        // Lock spine to strictly vertical to prevent hip jitter from affecting torso
-                                        spineDir = new this.THREE.Vector3(0, 1, 0); 
-                                        
-                                        // Use shoulder rotation to isolate torso Yaw (Twist)
-                                        let shoulderLeft = this.getDirectionVector(worldPose[12], worldPose[11]); 
+                                        spineDir = new this.THREE.Vector3(0, 1, 0);
+
+                                        let shoulderLeft = this.getDirectionVector(worldPose[12], worldPose[11]);
                                         if (shoulderLeft) {
-                                            // Flatten to XZ plane to prevent shoulder shrugging from tilting the spine
-                                            shoulderLeft.y = 0; 
+                                            shoulderLeft.y = 0;
                                             shoulderLeft.normalize();
-                                            // PRE-SMOOTHING FIX: Since worldPose[11] & [12] are now filtered, this cross product won't flip violently!
                                             torsoForward = new this.THREE.Vector3().crossVectors(shoulderLeft, spineDir).normalize();
                                             if (isNaN(torsoForward.x)) torsoForward = FORWARD;
                                         }
                                     } else if (worldPose[23] && worldPose[24]) {
                                         const hipMid = {
-                                            x: (worldPose[23].x + worldPose[24].x)/2,
-                                            y: (worldPose[23].y + worldPose[24].y)/2,
-                                            z: (worldPose[23].z + worldPose[24].z)/2,
+                                            x: (worldPose[23].x + worldPose[24].x) / 2,
+                                            y: (worldPose[23].y + worldPose[24].y) / 2,
+                                            z: (worldPose[23].z + worldPose[24].z) / 2,
                                             visibility: Math.min(worldPose[23].visibility, worldPose[24].visibility)
                                         };
                                         spineDir = this.getDirectionVector(hipMid, shoulderMid);
-                                        const hipLeft = this.getDirectionVector(worldPose[24], worldPose[23]); // R to L
+                                        const hipLeft = this.getDirectionVector(worldPose[24], worldPose[23]);
                                         if (hipLeft && spineDir && hipLeft.lengthSq() > 0.001) {
                                             torsoForward = new this.THREE.Vector3().crossVectors(hipLeft, spineDir).normalize();
                                             if (isNaN(torsoForward.x)) torsoForward = FORWARD;
                                         }
                                     }
                                 }
-                                
+
                                 const torsoBackward = torsoForward.clone().negate();
-                                
+
                                 this.boneLookAtDir(901, this.mocapBones[901], spineDir, currentTimeSec, torsoBackward);
                                 this.boneLookAtDir(902, this.mocapBones[902], spineDir, currentTimeSec, torsoBackward);
                                 this.boneLookAtDir(903, this.mocapBones[903], spineDir, currentTimeSec, torsoBackward);
 
-                                // BICEP ROLL FIX: Inverted the 90-degree local Y-axis roll to correctly face the biceps outward toward the camera.
                                 const leftRoll = -Math.PI / 2;
                                 const rightRoll = Math.PI / 2;
 
-                                this.boneLookAtDir(11, this.mocapBones[11], this.getDirectionVector(worldPose[11], worldPose[13], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, leftRoll); 
-                                this.boneLookAtDir(12, this.mocapBones[12], this.getDirectionVector(worldPose[12], worldPose[14], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, rightRoll); 
-                                this.boneLookAtDir(13, this.mocapBones[13], this.getDirectionVector(worldPose[13], worldPose[15], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, leftRoll); 
-                                this.boneLookAtDir(14, this.mocapBones[14], this.getDirectionVector(worldPose[14], worldPose[16], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, rightRoll); 
+                                this.boneLookAtDir(11, this.mocapBones[11], this.getDirectionVector(worldPose[11], worldPose[13], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, leftRoll);
+                                this.boneLookAtDir(12, this.mocapBones[12], this.getDirectionVector(worldPose[12], worldPose[14], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, rightRoll);
+                                this.boneLookAtDir(13, this.mocapBones[13], this.getDirectionVector(worldPose[13], worldPose[15], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, leftRoll);
+                                this.boneLookAtDir(14, this.mocapBones[14], this.getDirectionVector(worldPose[14], worldPose[16], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, rightRoll);
 
                                 if (!this.trackHands) {
-                                    this.boneLookAtDir(15, this.mocapBones[15], this.getDirectionVector(worldPose[15], worldPose[19], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, leftRoll); 
-                                    this.boneLookAtDir(16, this.mocapBones[16], this.getDirectionVector(worldPose[16], worldPose[20], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, rightRoll); 
+                                    this.boneLookAtDir(15, this.mocapBones[15], this.getDirectionVector(worldPose[15], worldPose[19], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, leftRoll);
+                                    this.boneLookAtDir(16, this.mocapBones[16], this.getDirectionVector(worldPose[16], worldPose[20], 0, false, torsoForward), currentTimeSec, torsoForward, Math.PI / 2, rightRoll);
                                 }
 
                                 if (!this.upperBodyOnly) {
-                                    // LOWER BODY REVERT: Restored torsoBackward and 0.3 pole vectors for thighs as requested.
-                                    this.boneLookAtDir(23, this.mocapBones[23], this.getDirectionVector(worldPose[23], worldPose[25], 0.3, false, torsoBackward), currentTimeSec, torsoBackward); 
-                                    this.boneLookAtDir(24, this.mocapBones[24], this.getDirectionVector(worldPose[24], worldPose[26], 0.3, false, torsoBackward), currentTimeSec, torsoBackward); 
-                                    this.boneLookAtDir(25, this.mocapBones[25], this.getDirectionVector(worldPose[25], worldPose[27], 0, false, torsoBackward), currentTimeSec, torsoBackward); 
-                                    this.boneLookAtDir(26, this.mocapBones[26], this.getDirectionVector(worldPose[26], worldPose[28], 0, false, torsoBackward), currentTimeSec, torsoBackward); 
+                                    this.boneLookAtDir(23, this.mocapBones[23], this.getDirectionVector(worldPose[23], worldPose[25], 0.3, false, torsoBackward), currentTimeSec, torsoBackward);
+                                    this.boneLookAtDir(24, this.mocapBones[24], this.getDirectionVector(worldPose[24], worldPose[26], 0.3, false, torsoBackward), currentTimeSec, torsoBackward);
+                                    this.boneLookAtDir(25, this.mocapBones[25], this.getDirectionVector(worldPose[25], worldPose[27], 0, false, torsoBackward), currentTimeSec, torsoBackward);
+                                    this.boneLookAtDir(26, this.mocapBones[26], this.getDirectionVector(worldPose[26], worldPose[28], 0, false, torsoBackward), currentTimeSec, torsoBackward);
 
                                     this.boneLookAtDir(27, this.mocapBones[27], this.getDirectionVector(worldPose[27], worldPose[31], 1.0, false, torsoBackward), currentTimeSec, torsoBackward);
                                     this.boneLookAtDir(28, this.mocapBones[28], this.getDirectionVector(worldPose[28], worldPose[32], 1.0, false, torsoBackward), currentTimeSec, torsoBackward);
                                 } else {
                                     [23, 24, 25, 26, 27, 28].forEach(idx => {
-                                        const existingB = this.motionData[this.currentFrameIndex]?.bones?.[idx];
+                                        const existingB = this.motionData[this.currentFrameIndex] && this.motionData[this.currentFrameIndex].bones ? this.motionData[this.currentFrameIndex].bones[idx] : null;
                                         const isBProtected = existingB && (existingB.isManual || existingB.isBlended);
 
                                         const b = this.mocapBones[idx];
@@ -2529,18 +2747,18 @@ class MocapSurgeonViewport {
                                         }
                                     });
                                 }
-                                
+
                                 if (worldPose[7] && worldPose[8] && worldPose[0]) {
                                     const earMid = {
-                                        x: (worldPose[7].x + worldPose[8].x)/2,
-                                        y: (worldPose[7].y + worldPose[8].y)/2,
-                                        z: (worldPose[7].z + worldPose[8].z)/2,
+                                        x: (worldPose[7].x + worldPose[8].x) / 2,
+                                        y: (worldPose[7].y + worldPose[8].y) / 2,
+                                        z: (worldPose[7].z + worldPose[8].z) / 2,
                                         visibility: Math.min(worldPose[7].visibility, worldPose[8].visibility)
                                     };
-                                    
+
                                     const headZ = this.getDirectionVector(earMid, worldPose[0]);
                                     const headX = this.getDirectionVector(worldPose[8], worldPose[7]);
-                                    
+
                                     let headUp = null;
                                     if (headZ && headX && headX.lengthSq() > 0.001) {
                                         headUp = new this.THREE.Vector3().crossVectors(headZ, headX).normalize();
@@ -2553,83 +2771,68 @@ class MocapSurgeonViewport {
                         }
                         if (this.rig) this.rig.updateMatrixWorld(true);
                     }
-                    
-                    // --- EXTREMITIES ADD-ON (Faces & Hands) ---
-                    // 1. Hands
-                    if (this.trackHands && this.currentHands && this.currentHands.worldLandmarks && this.currentHands.worldLandmarks.length > 0) {
-                        this.smoothedHands2D = []; // Clear for rendering
 
-                        for(let h = 0; h < this.currentHands.worldLandmarks.length; h++) {
+                    if (this.trackHands && this.currentHands && this.currentHands.worldLandmarks && this.currentHands.worldLandmarks.length > 0) {
+                        this.smoothedHands2D = [];
+
+                        for (let h = 0; h < this.currentHands.worldLandmarks.length; h++) {
                             const rawHandWorldPose = this.currentHands.worldLandmarks[h];
                             const rawHand2DPose = this.currentHands.landmarks[h];
-                            const handedness = this.currentHands.handednesses[h][0].categoryName; // "Left" or "Right"
-                            
-                            // PRE-SMOOTH RAW HAND POINTS (Hard bypass for instant hands)
+                            const handedness = this.currentHands.handednesses[h][0].categoryName;
+
                             const handWorldPose = this.filterLandmarks(rawHandWorldPose, this.handWorldFilters[handedness], currentTimeSec, 3, 0.0);
                             const hand2DPose = this.filterLandmarks(rawHand2DPose, this.hand2DFilters[handedness], currentTimeSec, 3, 0.0);
-                            
+
                             if (hand2DPose) this.smoothedHands2D.push(hand2DPose);
 
-                            const isVisualLeft = handedness === "Left"; // MediaPipe calls the mirrored left side "Left"
-                            const wristBoneId = isVisualLeft ? 16 : 15; // 16 is Rig Right (Visual Left). 15 is Rig Left (Visual Right)
+                            const isVisualLeft = handedness === "Left";
+                            const wristBoneId = isVisualLeft ? 16 : 15;
                             const wristBone = this.mocapBones[wristBoneId];
 
-                            // A) WRIST ORIENTATION OVERRIDE
                             if (wristBone && handWorldPose) {
-                                const handForward = this.getDirectionVector(handWorldPose[0], handWorldPose[9]); // Wrist to Middle Knuckle
-                                const indexDir = this.getDirectionVector(handWorldPose[0], handWorldPose[5]); // Wrist to Index
-                                const pinkyDir = this.getDirectionVector(handWorldPose[0], handWorldPose[17]); // Wrist to Pinky
-                                
+                                const handForward = this.getDirectionVector(handWorldPose[0], handWorldPose[9]);
+                                const indexDir = this.getDirectionVector(handWorldPose[0], handWorldPose[5]);
+                                const pinkyDir = this.getDirectionVector(handWorldPose[0], handWorldPose[17]);
+
                                 if (handForward && indexDir && pinkyDir) {
-                                    // PRE-SMOOTHING FIX: Palm Normal cross product will no longer randomly flip since indexDir and pinkyDir are stabilized
                                     let palmUp = new this.THREE.Vector3().crossVectors(indexDir, pinkyDir).normalize();
                                     if (isVisualLeft) palmUp.negate();
-                                    
+
                                     this.boneLookAtDir(wristBoneId, wristBone, handForward, currentTimeSec, palmUp);
                                 }
                             }
 
-                            // B) FINGER SWING
                             const dict = this.HAND_DICT[handedness];
                             if (dict && handWorldPose) {
-                                for(let finger of dict) {
+                                for (let finger of dict) {
                                     const dir = this.getDirectionVector(handWorldPose[finger.p1], handWorldPose[finger.p2]);
                                     this.boneSwingAtDir(finger.id, this.mocapBones[finger.id], dir, currentTimeSec, 3.0, 0.0);
                                 }
                             }
                         }
                     }
-                    
-                    // 2. Face Mesh (Additive Delta Translation with Auto Proportional Scaling)
-                    // BUGFIX: Wait until after the second frame (currentFrameIndex > 2) to let tracking stabilize.
-                    // This prevents capturing a garbage frame 0/1 rest-pose that causes the crushed face.
+
                     if (this.trackFace && this.currentFrameIndex > 2 && this.currentFace && this.currentFace.faceLandmarks && this.currentFace.faceLandmarks.length > 0) {
                         const currentFaceLm = this.currentFace.faceLandmarks[0];
-                        
-                        // PRE-SMOOTH 2D FACE POINTS (Bypass heavy smoothing for snappy face expressions)
+
                         this.smoothedFace2D = this.filterLandmarks(currentFaceLm, this.face2DFilters, currentTimeSec, -1.0, 0.0);
 
                         const vw = this.videoEl.videoWidth || 640;
                         const vh = this.videoEl.videoHeight || 480;
 
-                        // Passing viewport resolution maps to Isotropic Pixel Space preventing aspect distortion
-                        // FIX: Extract local coordinates using the ALREADY PRE-SMOOTHED face.
-                        // This stops the basis vectors (xAxis, yAxis) from wildly oscillating and crushing the face into the origin.
                         const localFace = this.extractFaceData(this.smoothedFace2D, vw, vh);
-                        
-                        // Capture precise rest pose on the very first read
+
                         if (!this.baseFaceLandmarks && localFace) {
                             this.baseFaceLandmarks = localFace;
                         }
-                        
-                        // Dynamic Visual Face Scale (Proportional ear-to-ear measuring mapping onto Rig world units)
-                        const rigL = this.mocapBones[300]; // OP_Face_0
-                        const rigR = this.mocapBones[316]; // OP_Face_16
-                        const rigChin = this.mocapBones[308]; // OP_Face_8
-                        const rigNose = this.mocapBones[327]; // OP_Face_27
-                        
+
+                        const rigL = this.mocapBones[300];
+                        const rigR = this.mocapBones[316];
+                        const rigChin = this.mocapBones[308];
+                        const rigNose = this.mocapBones[327];
+
                         let scaleX = 1.0, scaleY = 1.0;
-                        
+
                         if (rigL && rigR && rigChin && rigNose && this.baseFaceLandmarks) {
                             const rigWidth = rigL.userData.restPosition.distanceTo(rigR.userData.restPosition) || 0.15;
                             const rigHeight = rigChin.userData.restPosition.distanceTo(rigNose.userData.restPosition) || 0.15;
@@ -2645,35 +2848,32 @@ class MocapSurgeonViewport {
                             scaleX = rigWidth / mpWidth;
                             scaleY = rigHeight / mpHeight;
                         }
-                        
+
                         if (localFace && this.baseFaceLandmarks) {
-                            for(let i = 0; i < 70; i++) {
+                            for (let i = 0; i < 70; i++) {
                                 const mpIdx = this.MP_FACE_INDICES[i];
-                                const baseLm = this.baseFaceLandmarks[i]; // Reading linearly mapped un-rotated array
+                                const baseLm = this.baseFaceLandmarks[i];
                                 const currLm = localFace[i];
-                                
+
                                 if (baseLm && currLm) {
-                                    // Compute Delta and apply Three.js space inversions
                                     const dx = (currLm.x - baseLm.x) * scaleX;
-                                    const dy = -(currLm.y - baseLm.y) * scaleY; 
+                                    const dy = -(currLm.y - baseLm.y) * scaleY;
                                     const dz = -(currLm.z - baseLm.z) * scaleX;
-                                    
+
                                     this.bonePositionDelta(300 + i, this.mocapBones[300 + i], dx, dy, dz, currentTimeSec, -1.0, 0.0);
                                 }
                             }
                         }
                     }
-                } // End of isNewVideoFrame Check
+                } // End of isNewVideoFrame block
 
-                // --- 2D DEBUG DRAWING (Runs every frame to prevent flickering) ---
                 if (ctx && this.showMPPoints) {
                     const w = this.debugCanvas.width;
                     const h = this.debugCanvas.height;
 
-                    // By rendering the smoothed 2D landmarks, you can visually see the 1€ Filter working its magic!
                     if (this.smoothedPose2D && this.smoothedPose2D.length > 0) {
                         const pose = this.getMappedPose(this.smoothedPose2D);
-                        
+
                         ctx.lineWidth = 2;
                         ctx.strokeStyle = "rgba(0, 255, 0, 0.5)";
                         this.POSE_CONNECTIONS.forEach(([i, j]) => {
@@ -2688,7 +2888,7 @@ class MocapSurgeonViewport {
                         });
 
                         pose.forEach((lm, idx) => {
-                            if (this.MP_TO_MIXAMO[idx] && !isNaN(lm.x)) { 
+                            if (this.MP_TO_MIXAMO[idx] && !isNaN(lm.x)) {
                                 ctx.fillStyle = lm.visibility >= confThresh ? "#00ff00" : "#ff0000";
                                 ctx.beginPath();
                                 ctx.arc(lm.x * w, lm.y * h, 4, 0, 2 * Math.PI);
@@ -2697,7 +2897,6 @@ class MocapSurgeonViewport {
                         });
                     }
 
-                    // Draw Smoothed Face Dots
                     if (this.trackFace && this.smoothedFace2D && this.smoothedFace2D.length > 0) {
                         ctx.fillStyle = "white";
                         this.MP_FACE_INDICES.forEach(idx => {
@@ -2710,7 +2909,6 @@ class MocapSurgeonViewport {
                         });
                     }
 
-                    // Draw Smoothed Hand Dots
                     if (this.trackHands && this.smoothedHands2D && this.smoothedHands2D.length > 0) {
                         ctx.fillStyle = "magenta";
                         this.smoothedHands2D.forEach(handLm => {
@@ -2727,38 +2925,57 @@ class MocapSurgeonViewport {
             }
         } else {
             // --- PLAYBACK / SCRUB MODE (BYPASS AI AND READ FROM MEMORY) ---
-            const savedFrame = this.motionData[this.currentFrameIndex];
-            
-            if (savedFrame && this.rig) {
-                const hipsBone = this.mocapBones[99];
-                if (hipsBone && savedFrame.hipsPos) {
-                    if (!(this.transformControls && this.transformControls.dragging && this.selectedMpIdx == 99 && this.transformControls.mode === 'translate')) {
-                        hipsBone.position.set(savedFrame.hipsPos.x, savedFrame.hipsPos.y, savedFrame.hipsPos.z);
+            if (this.currentFrameIndex !== this._lastPlaybackFrame) {
+                this._lastPlaybackFrame = this.currentFrameIndex;
+                let savedFrame = this.motionData[this.currentFrameIndex];
+
+                // HOLE FILLING / INTERPOLATION
+                if (!savedFrame && Object.keys(this.motionData).length > 0) {
+                    let prevIdx = this.currentFrameIndex - 1;
+                    while (prevIdx >= 0 && !this.motionData[prevIdx]) prevIdx--;
+
+                    let nextIdx = this.currentFrameIndex + 1;
+                    let maxIdx = Math.max(...Object.keys(this.motionData).map(Number));
+                    while (nextIdx <= maxIdx && !this.motionData[nextIdx]) nextIdx++;
+
+                    if (this.motionData[prevIdx] && this.motionData[nextIdx]) {
+                        let t = (this.currentFrameIndex - prevIdx) / (nextIdx - prevIdx);
+                        savedFrame = this._interpolateFrames(this.motionData[prevIdx], this.motionData[nextIdx], t);
+                    } else if (this.motionData[prevIdx]) {
+                        savedFrame = this.motionData[prevIdx];
+                    } else if (this.motionData[nextIdx]) {
+                        savedFrame = this.motionData[nextIdx];
                     }
                 }
-                
-                // Read and apply all Data types (Rotations & Positions) safely
-                for (const [mpIdx, dat] of Object.entries(savedFrame.bones)) {
-                    if (this.transformControls && this.transformControls.dragging && String(this.selectedMpIdx) === String(mpIdx) && this.transformControls.mode === 'rotate') {
-                        continue; 
-                    }
-                    const bone = this.mocapBones[mpIdx];
-                    if (bone && dat) {
-                        if (parseInt(mpIdx) >= 300 && parseInt(mpIdx) <= 369) { // Face Bones = POS
-                            if (dat.posX !== undefined) bone.position.set(dat.posX, dat.posY, dat.posZ);
-                        } else { // Body & Hand Bones = ROT
-                            if (dat.x !== undefined) bone.quaternion.set(dat.x, dat.y, dat.z, dat.w);
+
+                if (savedFrame && this.rig) {
+                    const hipsBone = this.mocapBones[99];
+                    if (hipsBone && savedFrame.hipsPos) {
+                        if (!(this.transformControls && this.transformControls.dragging && this.selectedMpIdx == 99 && this.transformControls.mode === 'translate')) {
+                            hipsBone.position.set(savedFrame.hipsPos.x, savedFrame.hipsPos.y, savedFrame.hipsPos.z);
                         }
                     }
+
+                    for (const [mpIdx, dat] of Object.entries(savedFrame.bones)) {
+                        if (this.transformControls && this.transformControls.dragging && String(this.selectedMpIdx) === String(mpIdx) && this.transformControls.mode === 'rotate') {
+                            continue;
+                        }
+                        const bone = this.mocapBones[mpIdx];
+                        if (bone && dat) {
+                            if (parseInt(mpIdx) >= 300 && parseInt(mpIdx) <= 369) {
+                                if (dat.posX !== undefined) bone.position.set(dat.posX, dat.posY, dat.posZ);
+                            } else {
+                                if (dat.x !== undefined) bone.quaternion.set(dat.x, dat.y, dat.z, dat.w);
+                            }
+                        }
+                    }
+
+                    this.rig.updateMatrixWorld(true);
                 }
-                
-                this.rig.updateMatrixWorld(true);
             }
         }
-        
-        // --- 5. UPDATE SCALE-INDEPENDUAL VISUALIZERS ---
+
         if (this.customSkeletonGroup && this.showSkeleton) {
-            
             this.pickableObjects.forEach(picker => {
                 const bone = this.mocapBones[picker.userData.mpIdx];
                 if (bone) {
@@ -2773,7 +2990,7 @@ class MocapSurgeonViewport {
                     const p1 = b1.getWorldPosition(new this.THREE.Vector3());
                     const p2 = b2.getWorldPosition(new this.THREE.Vector3());
                     const distance = p1.distanceTo(p2);
-                    
+
                     if (distance > 0.001) {
                         cyl.mesh.position.copy(p1);
                         cyl.mesh.quaternion.setFromUnitVectors(new this.THREE.Vector3(0, 1, 0), p2.clone().sub(p1).normalize());
@@ -2786,17 +3003,10 @@ class MocapSurgeonViewport {
             });
         }
 
-        // --- DRAW ONION SKIN OVERLAYS ---
         this.drawOnionSkin();
-        
         this.renderer.render(this.scene, this.camera);
     }
 
-    /**
-     * GLB BAKE & EXPORT
-     * Strategy: Strip meshes, clone ONLY the bone hierarchy, and rename bones to 
-     * simple strings to prevent GLTFExporter from crashing on dots/colons.
-     */
     async exportToGLB(filename) {
         if (!this.rig || Object.keys(this.motionData).length === 0) {
             console.error("[Mocap Surgeon] No rig or motion data to export.");
@@ -2804,26 +3014,23 @@ class MocapSurgeonViewport {
         }
 
         const fps = 30;
-        
-        // 1. RANGE EXPORT LOGIC: Figure out if we are exporting everything, or just a highlighted chunk
+
         let startF = this.markInFrame != null ? this.markInFrame : 0;
         let endF = this.markOutFrame != null ? this.markOutFrame : Number.MAX_SAFE_INTEGER;
         if (startF > endF) { let temp = startF; startF = endF; endF = temp; }
 
         const frameIndices = Object.keys(this.motionData)
             .map(Number)
-            .filter(f => f >= startF && f <= endF) // Only grab frames inside the IN/OUT brackets
+            .filter(f => f >= startF && f <= endF)
             .sort((a, b) => a - b);
-            
+
         if (frameIndices.length === 0) return false;
-        
-        // 2. ZERO-PADDING LOGIC: We need the first exported frame to be exactly at time = 0.0s
+
         const exportStartTime = frameIndices[0];
 
-        // 1. EXTRACT PURE BONE HIERARCHY
         let originalRootBone = null;
         this.rig.traverse(child => {
-            if (child.isBone && !child.parent?.isBone) {
+            if (child.isBone && !(child.parent && child.parent.isBone)) {
                 originalRootBone = child;
             }
         });
@@ -2835,26 +3042,22 @@ class MocapSurgeonViewport {
 
         const exportScene = new this.THREE.Scene();
         exportScene.name = "ActionDirector_Mocap_Export";
-        
+
         const clonedRoot = originalRootBone.clone(true);
         exportScene.add(clonedRoot);
 
-        // Sanitize bone names globally in the clone to simple strings
         clonedRoot.traverse(child => {
             if (child.isBone) {
                 let found = false;
-                
-                // Check Core Body
+
                 for (const [mpIdx, mixamoNames] of Object.entries(this.MP_TO_MIXAMO)) {
-                    // FIX: Use strict matching to prevent "RightHandThumb" from matching "RightHand"
                     if (mixamoNames.some(mn => child.name === mn || child.name.endsWith(mn))) {
                         child.name = this.BONE_EXPORT_NAMES[mpIdx];
                         found = true;
                         break;
                     }
                 }
-                
-                // Check Face Bones
+
                 if (!found && child.name.includes("OP_Face_")) {
                     const match = child.name.match(/OP_Face_(\d+)/);
                     if (match) {
@@ -2862,48 +3065,43 @@ class MocapSurgeonViewport {
                         found = true;
                     }
                 }
-                
-                // Check Hand Bones
+
                 if (!found) {
                     ["Left", "Right"].forEach(side => {
                         this.HAND_DICT[side].forEach(finger => {
                             if (child.name.includes(finger.name)) {
-                                child.name = finger.name; // Preserves simple export name
+                                child.name = finger.name;
                             }
                         });
                     });
                 }
-                
+
                 child.matrixAutoUpdate = true;
             } else {
-                child.parent?.remove(child);
+                if (child.parent) child.parent.remove(child);
             }
         });
 
-        // 2. BUILD TRACKS USING SIMPLIFIED NAMES
         const tracks = [];
-        
-        // MEMORY CORRUPTION FIX: Create temporary isolated filters for Export
+
         const tempQuatFilters = {};
         const tempPosFilters = {};
 
         for (const [mpIdx, simpleName] of Object.entries(this.BONE_EXPORT_NAMES)) {
             const posTimes = [], posVals = [];
             const quatTimes = [], quatVals = [];
-            
+
             frameIndices.forEach(fIdx => {
                 const frame = this.motionData[fIdx];
                 const t = (fIdx - exportStartTime) / fps;
 
-                // Hips Position (Index 99)
                 if (mpIdx == 99 && frame.hipsPos && !isNaN(frame.hipsPos.x)) {
                     let hPos = frame.hipsPos;
-                    // MEMORY CORRUPTION FIX: Safely re-filter the raw export data using slider settings
                     if (hPos.rawX !== undefined) {
                         if (!tempPosFilters[99]) tempPosFilters[99] = new OneEuroFilter3D(30);
                         let rawP = { x: hPos.rawX, y: hPos.rawY, z: hPos.rawZ };
                         let fp = tempPosFilters[99].filter(rawP, t, this.filterMinCutoff, this.filterBeta);
-                        
+
                         if (hPos.isManual || hPos.isBlended) {
                             posTimes.push(t);
                             posVals.push(hPos.x, hPos.y, hPos.z);
@@ -2920,16 +3118,14 @@ class MocapSurgeonViewport {
                     }
                 }
 
-                const boneFrame = frame.bones?.[mpIdx];
+                const boneFrame = frame.bones && frame.bones[mpIdx];
                 if (boneFrame) {
-                    // EXTREMITIES ROUTER: Faces = POS. Hands & Body = ROT.
                     if (mpIdx >= 300 && mpIdx <= 369 && !isNaN(boneFrame.posX)) {
-                        // Safely refilter raw face positions using UI slider values
                         if (boneFrame.rawX !== undefined) {
                             if (!tempPosFilters[mpIdx]) tempPosFilters[mpIdx] = new OneEuroFilter3D(30);
                             let rawP = { x: boneFrame.rawX, y: boneFrame.rawY, z: boneFrame.rawZ };
                             let fp = tempPosFilters[mpIdx].filter(rawP, t, this.filterMinCutoff, this.filterBeta);
-                            
+
                             if (boneFrame.isManual || boneFrame.isBlended) {
                                 posTimes.push(t);
                                 posVals.push(boneFrame.posX, boneFrame.posY, boneFrame.posZ);
@@ -2945,12 +3141,11 @@ class MocapSurgeonViewport {
                             posVals.push(boneFrame.posX, boneFrame.posY, boneFrame.posZ);
                         }
                     } else if (!isNaN(boneFrame.x)) {
-                        // EXPORT JITTER FIX: Safely Re-run filter on the raw recorded quaternion with current UI slider values!
                         if (boneFrame.rawX !== undefined) {
                             if (!tempQuatFilters[mpIdx]) tempQuatFilters[mpIdx] = new OneEuroFilterQuat(30);
                             let rawQ = { x: boneFrame.rawX, y: boneFrame.rawY, z: boneFrame.rawZ, w: boneFrame.rawW };
                             let fq = tempQuatFilters[mpIdx].filter(rawQ, t, this.filterMinCutoff, this.filterBeta);
-                            
+
                             if (boneFrame.isManual || boneFrame.isBlended) {
                                 quatTimes.push(t);
                                 quatVals.push(boneFrame.x, boneFrame.y, boneFrame.z, boneFrame.w);
@@ -2962,7 +3157,6 @@ class MocapSurgeonViewport {
                                 quatVals.push(boneFrame.x, boneFrame.y, boneFrame.z, boneFrame.w);
                             }
                         } else {
-                            // Fallback for manual keyframes and blended frames without raw
                             quatTimes.push(t);
                             quatVals.push(boneFrame.x, boneFrame.y, boneFrame.z, boneFrame.w);
                         }
@@ -2984,20 +3178,20 @@ class MocapSurgeonViewport {
         }
 
         const clip = new this.THREE.AnimationClip("MocapBake", -1, tracks);
-        
+
         clip.userData = clip.userData || {};
         exportScene.userData = exportScene.userData || {};
-        
+
         if (!this.THREE.AnimationClip.prototype._mocapSurgeonPatched) {
             const originalClone = this.THREE.AnimationClip.prototype.clone;
-            this.THREE.AnimationClip.prototype.clone = function() {
+            this.THREE.AnimationClip.prototype.clone = function () {
                 const cloned = originalClone.apply(this, arguments);
                 cloned.userData = cloned.userData || {};
                 return cloned;
             };
             this.THREE.AnimationClip.prototype._mocapSurgeonPatched = true;
         }
-        
+
         exportScene.updateMatrixWorld(true);
 
         try {
@@ -3007,14 +3201,14 @@ class MocapSurgeonViewport {
                     exportScene,
                     (res) => resolve(res),
                     (err) => reject(err),
-                    { 
-                        binary: true, 
+                    {
+                        binary: true,
                         animations: [clip],
                         includeCustomExtensions: false
                     }
                 );
             });
-            
+
             const blob = new Blob([glbResult], { type: 'application/octet-stream' });
             const formData = new FormData();
             formData.append("file", blob);
@@ -3037,35 +3231,70 @@ class MocapSurgeonViewport {
 app.registerExtension({
     name: "Yedp.MocapSurgeon",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        
+
         if (nodeData.name === "YedpMocapSurgeon") {
             const onNodeCreated = nodeType.prototype.onNodeCreated;
-            
+
             nodeType.prototype.onNodeCreated = function () {
                 const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-                
+
                 const container = document.createElement("div");
                 container.classList.add("yedp-mocap-surgeon-container");
-                container.style.width = "100%"; 
-                container.style.height = "100%"; 
-                
-                this.addDOMWidget("mocap_viewport", "vp", container, { serialize: false, hideOnZoom: false });
-                
+
+                const widget = this.addDOMWidget("mocap_viewport", "vp", container, { serialize: false, hideOnZoom: false });
+
+                // 1. Dynamic Widget Sizing: Tell LiteGraph this widget consumes the entire node height
+                widget.computeSize = function (width) {
+                    // We subtract ~40px to account for the node title bar
+                    return [width, this.parent ? this.parent.size[1] - 40 : 480];
+                };
+
                 setTimeout(() => {
                     this.vp = new MocapSurgeonViewport(this, container);
-                    
-                    const infoWidget = this.widgets?.find(w => w.name === "info");
-                    if (infoWidget) {
-                        infoWidget.computeSize = () => [0, -4];
-                        if (infoWidget.inputEl) {
-                            infoWidget.inputEl.style.display = "none";
+
+                    // Robust logic to find and hide the backend string output
+                    if (this.widgets) {
+                        for (let w of this.widgets) {
+                            if (w.name === "info" || w.type === "customtext" || typeof w.value === "string") {
+                                w.computeSize = () => [0, -4];
+                                if (w.inputEl) {
+                                    w.inputEl.style.display = "none";
+                                } else if (w.element) {
+                                    w.element.style.display = "none";
+                                }
+                            }
                         }
                     }
+
+                    // Force an initial layout sync after the UI settles
+                    if (this.size) {
+                        container.style.width = this.size[0] + "px";
+                        container.style.height = (this.size[1] - 40) + "px";
+                        if (this.vp) this.vp.onResize();
+                    }
                 }, 100);
-                
-                this.setSize([640, 480]);
-                
-                this.onRemoved = function() {
+
+                // 2. The Crucial Resize Hook: Actively push pixel dimensions to the DOM
+                const onResize = this.onResize;
+                this.onResize = function (size) {
+                    if (onResize) onResize.apply(this, arguments);
+
+                    if (container) {
+                        // size[0] is width, size[1] is height
+                        container.style.width = size[0] + "px";
+                        container.style.height = (size[1] - 40) + "px";
+                    }
+
+                    // Tell Three.js the canvas changed size so the camera aspect updates
+                    if (this.vp) {
+                        this.vp.onResize();
+                    }
+                };
+
+                // Set a comfortable default size for a 3D viewport
+                this.setSize([800, 600]);
+
+                this.onRemoved = function () {
                     if (this.vp) {
                         if (this.vp.resizeObserver) this.vp.resizeObserver.disconnect();
                         if (this.vp.renderer) { this.vp.renderer.dispose(); this.vp.renderer = null; }
