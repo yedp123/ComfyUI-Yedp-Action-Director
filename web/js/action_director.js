@@ -2578,8 +2578,16 @@ class YedpViewport {
                 try {
                     this.mocapMediaStream = await navigator.mediaDevices.getUserMedia({video: true});
                     this.mocapVideoEl.srcObject = this.mocapMediaStream;
-                    this.mocapVideoEl.onloadedmetadata = () => {
-                        this.mocapVideoEl.play(); this.isMocapActive = true; 
+                    this.mocapVideoEl.onloadedmetadata = async () => {
+                        try {
+                            await this.mocapVideoEl.play();
+                        } catch (err) {
+                            console.error("[Yedp] mocapVideoEl.play() failed:", err);
+                            this.debugMocapText.innerText = `Play failed: ${err.message}`;
+                            this.debugMocapText.style.color = "#f55";
+                        }
+                        console.log(`[Yedp] Webcam ready. paused=${this.mocapVideoEl.paused}, readyState=${this.mocapVideoEl.readyState}`);
+                        this.isMocapActive = true;
                         btnRec.disabled = false; btnRec.style.opacity = "1.0";
                         this.mocapLoop();
                     };
@@ -2779,6 +2787,7 @@ class YedpViewport {
             } else {
                 this.isMocapRecording = false;
                 btnRec.innerText = "🔴 Rec"; btnRec.style.background = "#511";
+                this.debugMocapText.style.color = "";
                 this.debugMocapText.innerText = "Tracking";
                 if (this.currentMocapSession && this.currentMocapSession.frames.length > 0) {
                     const elapsed = (performance.now() - this.currentMocapSession.startTime) / 1000;
@@ -2786,13 +2795,18 @@ class YedpViewport {
                     this.currentMocapSession.fps = this.currentMocapSession.frames.length / elapsed;
                     this.recordedMocaps.push(this.currentMocapSession);
                     this.syncMocapDropdowns();
-                    this.saveMocapToServer(this.currentMocapSession); 
-                    this.debugMocapText.innerText = `Saved (${this.currentMocapSession.frames.length}f)`;
-                    
+                    this.saveMocapToServer(this.currentMocapSession);
+                    this.debugMocapText.innerText = `Saving (${this.currentMocapSession.frames.length}f)...`;
+
                     // Clear input visually for next capture
                     if (nameInput) nameInput.value = "";
                 } else {
-                    this.debugMocapText.innerText = "Empty capture discarded.";
+                    const reason = !this.faceLandmarker
+                        ? "MediaPipe not loaded"
+                        : "No face detected during recording (check lighting / face in frame)";
+                    this.debugMocapText.innerText = `⚠ Empty capture discarded — ${reason}`;
+                    this.debugMocapText.style.color = "#fb3";
+                    console.warn(`[Yedp] Empty mocap capture discarded. Reason: ${reason}`);
                 }
                 this.currentMocapSession = null;
             }
@@ -2884,12 +2898,35 @@ class YedpViewport {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(mocapData)
             });
+            if (!res.ok) {
+                const txt = await res.text().catch(() => `HTTP ${res.status}`);
+                console.error(`[Yedp] Save mocap HTTP ${res.status}:`, txt);
+                if (this.debugMocapText) {
+                    this.debugMocapText.innerText = `Save FAILED (HTTP ${res.status}) — see console`;
+                    this.debugMocapText.style.color = "#f55";
+                }
+                return;
+            }
             const data = await res.json();
             if (data.status === "success") {
                 console.log(`[Yedp] Saved mocap to file: ${data.file}`);
+                if (this.debugMocapText) {
+                    this.debugMocapText.innerText = `✅ Saved: ${data.file}`;
+                    this.debugMocapText.style.color = "#5f5";
+                }
+            } else {
+                console.error("[Yedp] Save mocap returned error:", data);
+                if (this.debugMocapText) {
+                    this.debugMocapText.innerText = `Save error: ${data.message || "unknown"}`;
+                    this.debugMocapText.style.color = "#f55";
+                }
             }
         } catch (e) {
             console.error("[Yedp] Failed to save mocap to disk", e);
+            if (this.debugMocapText) {
+                this.debugMocapText.innerText = `Save FAILED: ${e.message}`;
+                this.debugMocapText.style.color = "#f55";
+            }
         }
     }
 
@@ -2987,9 +3024,16 @@ class YedpViewport {
                         ctx.fill();
                     });
 
-                    if (this.isMocapRecording && this.currentMocapSession && !this.mocapVideoEl.paused && isWebcam) {
+                    if (this.isMocapRecording && this.currentMocapSession && isWebcam) {
                         const framePoints = this.extractFaceData(face, w, h);
                         this.currentMocapSession.frames.push(framePoints);
+                        const n = this.currentMocapSession.frames.length;
+                        if (n === 1) {
+                            console.log(`[Yedp] First webcam frame captured. paused=${this.mocapVideoEl.paused}, readyState=${this.mocapVideoEl.readyState}, ts=${performance.now()}`);
+                        }
+                        if (n % 10 === 0) {
+                            this.debugMocapText.innerText = `🔴 RECORDING... ${n}f`;
+                        }
                     }
                 }
             }
