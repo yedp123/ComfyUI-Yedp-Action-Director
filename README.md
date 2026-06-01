@@ -179,10 +179,10 @@ This project is open-source and available under the **MIT License**.
 
 created by Yedp. 
 
-Special thanks to mizumori-bit (https://github.com/mizumori-bit/) for his contribution on Orthographic/Views/Lighting implementation.
-
-
-Some of the 3D models used in Yedp Blockout node are CCO models generously shared by [Tim Steer](https://www.thebasemesh.com/about), feel free to give him a tip if you like his amazing work!
+**Special thanks:** 
+- [mizumori-bit](https://github.com/mizumori-bit) for his contribution on Orthographic/Views/Lighting implementation.
+- [MundusCaeli](https://github.com/MundusCaeli) for improving error handling for webcam streams, fixed recording-pause bugs, and adding real-time Mocap UI feedback.
+- Some of the 3D models used in Yedp Blockout node are CCO models generously shared by [Tim Steer](https://www.thebasemesh.com/about), feel free to give him a tip if you like his amazing work!
 
 
 Yedp-Action-Director is built upon the incredible work of the open-source community.
