@@ -1,5 +1,9 @@
 # **🎬 ComfyUI Yedp Action Director**
 
+>[!WARNING] 
+>*Prefer a standalone app? YEDP Action Director has been expanded into a full desktop application with GPU path-tracing and a local Virtual File System. Get the Windows release **[HERE](https://github.com/yedp123/YEDP-Action-Director)***
+
+
 
 https://github.com/user-attachments/assets/87328a44-5249-42f3-8b54-de18e7545398
 
